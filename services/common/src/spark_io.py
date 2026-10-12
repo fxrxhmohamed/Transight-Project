@@ -65,6 +65,12 @@ def session(app: str = "metaflow-dq") -> SparkSession:
         .config("spark.sql.execution.arrow.pyspark.fallback.enabled", "false")
         # Wide rule plans: keep the optimizer from re-analysing them for long.
         .config("spark.sql.optimizer.maxIterations", "200")
+        # A momentary DNS failure on "postgres" (Docker's resolver under
+        # load) must not end a long run: the JVM caches failed lookups for
+        # 10s, so every retry of the task failed on the cached miss. Look
+        # the host up again on each attempt and allow more attempts.
+        .config("spark.executor.extraJavaOptions", "-Dsun.net.inetaddr.negative.ttl=0")
+        .config("spark.task.maxFailures", "8")
     )
     if os.environ.get("SPARK_DRIVER_HOST"):
         builder = builder.config("spark.driver.host", os.environ["SPARK_DRIVER_HOST"])

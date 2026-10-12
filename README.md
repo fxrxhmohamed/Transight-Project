@@ -21,7 +21,9 @@ source CSV
   -> correct      correction UI or a correction file   <- people
   -> revalidate   fixed records resolved, the rest back to quarantine
   -> merge        silver.<dataset> (valid + resolved)
-  -> metrics      metrics.dq_run, dq_rule_result, dq_quarantine, dq_correction
+  -> metrics      metrics.dq_run, dq_rule_result, dq_quarantine, dq_correction (dbt)
+  -> metadata     meta.* (what silver holds: entities, keys, relationships)
+  -> gold         gold.fact_* / dim_* star schema, then marts.* (dbt)
 ```
 
 ## Project structure
@@ -53,12 +55,17 @@ MetaFlow-DQ/
 │       ├── values.py            typed values and canonical formats
 │       ├── quarantine.py        correction template, import, re-validation
 │       ├── merge.py             valid + resolved -> silver.<dataset>
-│       ├── metrics.py           metrics.* tables for Power BI
 │       ├── correction_ui.py     Streamlit correction UI
 │       ├── correction_assist.py wording and suggestions for the UI
 │       ├── layout.py            which table holds which output of a run
 │       ├── db.py                PostgreSQL access (transactions, COPY)
 │       └── import_files.py      load runs kept in data/ by earlier versions
+│
+├── dbt/                         metric tables and the MetricFlow semantic layer
+│   ├── models/dq/               metrics.* from the dq schema (+ DQ metrics)
+│   ├── models/business/         marts.* from gold (+ business metrics)
+│   ├── models/semantic/         time spine for MetricFlow
+│   └── requirements.txt         dbt-core, dbt-postgres, dbt-metricflow
 │
 ├── airflow/
 │   ├── Dockerfile               Airflow image with the pipeline's Python
@@ -85,7 +92,14 @@ python -m venv .venv
 # Windows: .venv\Scripts\activate      Linux/macOS: source .venv/bin/activate
 python -m pip install -r services/dq-service/requirements.txt \
                       -r services/metadata-service/requirements.txt
+
+# dbt and MetricFlow (metrics step) in a virtual environment of their own:
+python -m venv .venv-dbt
+.venv-dbt/bin/pip install -r dbt/requirements.txt   # Windows: .venv-dbt\Scripts\pip
+# then point dq.py at it: DBT=.venv-dbt/bin/dbt (or put it on the PATH)
 ```
+
+The Docker images have both already (`/opt/dbt`, with `DBT` set).
 
 The data is not in the repository. Put the source file at
 `data/raw/banking/banking_transactions.csv`. Ingestion loads it into the
@@ -280,9 +294,9 @@ The wording and suggestions come from the schema registry
 
 | DAG | Tasks | When |
 |---|---|---|
-| `dq_ingest_validate` | ingest, profile, validate, merge, metrics | a new file; param `input` |
-| `dq_apply_corrections` | import-corrections, revalidate, merge, metrics | a filled-in correction file; params `run`, `file` |
-| `dq_publish` | merge, metrics | every day at 18:00 (records fixed in the UI) |
+| `dq_ingest_validate` | ingest, profile, validate, merge, metrics, metadata, gold | a new file; param `input` |
+| `dq_apply_corrections` | import-corrections, revalidate, merge, metrics, metadata, gold | a filled-in correction file; params `run`, `file` |
+| `dq_publish` | merge, metrics, metadata, gold | every day at 18:00 (records fixed in the UI) |
 
 Locally with Docker (Airflow 3, no login, for development only):
 
@@ -296,9 +310,10 @@ docker compose down                      # stop; data stays in the
 The project folder is mounted at `/opt/metaflow` (code, config, source
 files), and the DAGs use the same database as the commands and the UI.
 The pipeline runs in its own
-virtual environment inside the image. Elsewhere, Airflow workers need
-`METAFLOW_HOME` (the project folder), `METAFLOW_PYTHON` (a Python with
-the requirements above) and the `POSTGRES_*` variables.
+virtual environment inside the image, dbt in another (`/opt/dbt`).
+Elsewhere, Airflow workers need `METAFLOW_HOME` (the project folder),
+`METAFLOW_PYTHON` (a Python with the requirements above), `DBT` (the dbt
+executable) and the `POSTGRES_*` variables.
 
 ## Tests and CI
 
@@ -318,7 +333,8 @@ python -m pytest tests
 The tests create a temporary database (`metaflow_test_*`) and drop it at
 the end, so the user in `.env` needs `CREATEDB`. GitHub Actions runs the
 same tests, with a PostgreSQL service, on every push and pull request
-(`.github/workflows/data-quality.yml`). `tests/data/build_sample.py`
+(`.github/workflows/data-quality.yml`), after checking the dbt project and
+its semantic layer (`dbt parse`, `mf validate-configs`). `tests/data/build_sample.py`
 rebuilds the dataset from a validated run.
 
 ## Configuration
@@ -335,8 +351,11 @@ repair: `critical` -> quarantine, `warning` -> accepted and flagged,
 
 ## Data quality metrics
 
-`python dq.py metrics` rebuilds four tables in the `metrics` schema (the
-rows of the runs it measures are replaced); connect Power BI to them:
+The metric tables are dbt models (`dbt/`). `python dq.py metrics` runs
+`dbt build --select tag:dq`: it rebuilds four tables in the `metrics`
+schema for every run, from the `dq` schema, and tests them (each table is
+swapped in whole, so readers never see a half-built one). Connect Power
+BI to them:
 
 | Table | One row per |
 |---|---|
@@ -352,4 +371,44 @@ rows of the runs it measures are replaced); connect Power BI to them:
   discarded or unresolved
 
 The latest round of a run gives the funnel directly, e.g. 350 with
-issues -> 200 auto-fixed -> 130 manually fixed -> 20 unresolved.
+issues -> 200 auto-fixed -> 130 manually fixed -> 20 unresolved
+(`is_latest_round` marks it).
+
+### Business marts
+
+`python dq.py gold` builds the gold star schema, then runs `dbt build
+--select tag:gold`: views over gold in the `marts` schema
+(`fct_transactions`, `dim_banks`, `dim_branches`, `dim_customers`) and
+`marts.transaction_monthly`, transactions per month, bank, channel, type
+and status (counts, amounts in EGP, channel cost) for Power BI. These
+models are written for the banking_transactions dataset.
+
+### Semantic layer (MetricFlow)
+
+The metrics themselves are defined once, in dbt's semantic layer
+(`dbt/models/dq/_dq_semantic.yml`, `dbt/models/business/_business.yml`):
+
+| Metric | Definition |
+|---|---|
+| `dq_initial_score`, `dq_final_score` | valid / processed, (valid + resolved) / processed |
+| `dq_auto_fix_rate`, `dq_resolution_rate` | auto-fixed / records with issues, resolved / quarantined |
+| `dq_rule_failure_rate`, `dq_rule_repair_rate` | failed / checked, repaired / failed (per rule, dimension, severity) |
+| `dq_corrections`, `dq_manual_corrections`, ... | counts of the record funnel and the corrections |
+| `transactions`, `transaction_amount_egp`, `average_transaction_egp` | count, sum and average of the transactions |
+| `failure_rate`, `digital_share`, `cost_per_transaction_egp` | failed / all, digital channel / all, channel cost / transaction |
+| `active_customers`, `digital_migration_opportunities` | distinct customers, flagged transactions |
+
+Query them with MetricFlow, from `dbt/` (in the pipeline container:
+`docker compose run --rm -w /opt/metaflow/dbt pipeline mf query ...`):
+
+```bash
+dbt parse --profiles-dir .     # once, and after changing the YAML: writes target/
+mf query --metrics dq_initial_score,dq_final_score --group-by run_round__run_id
+mf query --metrics dq_rule_failure_rate --group-by rule_result__dimension
+mf query --metrics transactions,failure_rate --group-by metric_time__month,bank__bank_name
+mf query --metrics active_customers --group-by customer__customer_segment
+mf list metrics
+```
+
+Power BI reads the tables above; the semantic layer API for BI tools is
+part of dbt Cloud only.

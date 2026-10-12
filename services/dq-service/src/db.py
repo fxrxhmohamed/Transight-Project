@@ -77,8 +77,8 @@ def transaction() -> Iterator[psycopg.Connection]:
 
 
 def ensure_schema(conn: psycopg.Connection) -> None:
-    """Create the dq, silver and metrics tables when they are missing
-    (database volumes created before them)."""
+    """Create the dq and silver tables when they are missing (database
+    volumes created before them)."""
 
     schemas.ensure(conn, "02_dq.sql")
 

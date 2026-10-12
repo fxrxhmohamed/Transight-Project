@@ -16,7 +16,8 @@ dataset:
 
 Column types are silver's. Every table is built under a temporary name
 and swapped in, all in one transaction, so readers (Power BI) never see a
-half-built star.
+half-built star. The business marts on it are dbt models (dbt/models/
+business), built by "python dq.py gold" after this script.
 
 Usage
 -----
@@ -200,9 +201,11 @@ def build(dataset: str) -> dict[str, int]:
         counts[name] = df.count()
     records.unpersist()
 
+    # CASCADE: the dbt views on gold (marts.fct_transactions, ...) go with
+    # the old tables; "python dq.py gold" builds them again right after.
     with bronze.connect() as conn, conn.transaction():
         for name in ddl:
-            conn.execute(f"DROP TABLE IF EXISTS gold.{quote(name)}")
+            conn.execute(f"DROP TABLE IF EXISTS gold.{quote(name)} CASCADE")
             conn.execute(f"ALTER TABLE gold.{quote(name + '__new')} RENAME TO {quote(name)}")
     return counts
 

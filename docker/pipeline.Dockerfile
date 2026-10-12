@@ -1,5 +1,6 @@
 # Runtime of every pipeline step (dq.py), the tests and the correction UI:
-# Python, Java for Spark, PySpark and the PostgreSQL JDBC driver.
+# Python, Java for Spark, PySpark, the PostgreSQL JDBC driver, and dbt with
+# MetricFlow in their own virtual environment (/opt/dbt: dbt, mf).
 #
 #   docker compose build pipeline
 #   docker compose run --rm pipeline python dq.py --help
@@ -32,6 +33,12 @@ RUN pip install --no-cache-dir \
         -r /tmp/requirements-metadata.txt \
         -r /tmp/requirements-dq.txt \
         pytest==9.1.1
+
+# dbt and MetricFlow (the metric tables): their own virtual environment, so
+# they never clash with the pipeline's pinned pandas/numpy.
+COPY dbt/requirements.txt /tmp/requirements-dbt.txt
+RUN python -m venv /opt/dbt     && /opt/dbt/bin/pip install --no-cache-dir -r /tmp/requirements-dbt.txt
+ENV DBT=/opt/dbt/bin/dbt     PATH=$PATH:/opt/dbt/bin
 
 WORKDIR /opt/metaflow
 CMD ["python", "dq.py", "--help"]

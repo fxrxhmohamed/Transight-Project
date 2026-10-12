@@ -8,7 +8,8 @@
 #
 # The packages come from the pipeline image (docker-compose.yml passes it
 # in as the "pipeline" build context): both use CPython 3.12 on Debian, and
-# PySpark (~450 MB) is not downloaded a second time.
+# PySpark (~450 MB) is not downloaded a second time. dbt and MetricFlow
+# come the same way, as the pipeline image's /opt/dbt environment.
 
 FROM eclipse-temurin:17-jre-jammy AS java
 
@@ -28,3 +29,5 @@ USER airflow
 RUN python -m venv /home/airflow/metaflow-venv
 COPY --from=pipeline --chown=airflow:root /usr/local/lib/python3.12/site-packages \
     /home/airflow/metaflow-venv/lib/python3.12/site-packages
+COPY --from=pipeline /opt/dbt /opt/dbt
+ENV DBT=/opt/dbt/bin/dbt

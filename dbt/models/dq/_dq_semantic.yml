@@ -1,0 +1,304 @@
+version: 2
+
+# DQ metrics for MetricFlow, e.g. (inside dbt/):
+#   mf query --metrics dq_initial_score,dq_final_score --group-by run_round__run_id
+#   mf query --metrics dq_rule_failure_rate --group-by rule_result__dimension
+
+semantic_models:
+  - name: dq_runs
+    description: Runs and rounds (metrics.dq_run).
+    model: ref('dq_run')
+    defaults:
+      agg_time_dimension: finished_at
+    entities:
+      - name: run_round
+        type: primary
+        expr: "dataset || '/' || run_id || '/' || round"
+    dimensions:
+      - name: finished_at
+        type: time
+        type_params:
+          time_granularity: day
+      - name: run_id
+        type: categorical
+      - name: dataset
+        type: categorical
+      - name: round_type
+        type: categorical
+      - name: source_file
+        type: categorical
+      - name: rules_version
+        type: categorical
+      - name: is_latest_round
+        type: categorical
+    measures:
+      - name: processed_records
+        agg: sum
+        expr: processed
+      - name: valid_records
+        agg: sum
+        expr: valid
+      - name: auto_fixed_records
+        agg: sum
+      - name: quarantined_records
+        agg: sum
+        expr: quarantined
+      - name: records_with_issues
+        agg: sum
+      - name: resolved_records
+        agg: sum
+        expr: resolved
+      - name: valid_or_resolved_records
+        agg: sum
+        expr: valid + resolved
+      - name: manually_fixed_records
+        agg: sum
+      - name: confirmed_records
+        agg: sum
+      - name: discarded_records
+        agg: sum
+        expr: discarded
+      - name: unresolved_records
+        agg: sum
+
+  - name: dq_rule_results
+    description: Rule statistics per run and round (metrics.dq_rule_result).
+    model: ref('dq_rule_result')
+    defaults:
+      agg_time_dimension: finished_at
+    entities:
+      - name: rule_result
+        type: primary
+        expr: "dataset || '/' || run_id || '/' || round || '/' || rule_id"
+    dimensions:
+      - name: finished_at
+        type: time
+        type_params:
+          time_granularity: day
+      - name: run_id
+        type: categorical
+      - name: dataset
+        type: categorical
+      - name: round_type
+        type: categorical
+      - name: rule_id
+        type: categorical
+      - name: rule_name
+        type: categorical
+      - name: rule_column
+        type: categorical
+        expr: '"column"'
+      - name: dimension
+        type: categorical
+      - name: severity
+        type: categorical
+      - name: error_category
+        type: categorical
+    measures:
+      - name: rule_checks
+        agg: sum
+        expr: checked
+      - name: rule_failures
+        agg: sum
+        expr: failed
+      - name: rule_repairs
+        agg: sum
+        expr: repaired
+      - name: rule_unresolved
+        agg: sum
+        expr: unresolved
+
+  - name: dq_corrections
+    description: Automatic repairs and manual corrections (metrics.dq_correction).
+    model: ref('dq_correction')
+    primary_entity: correction
+    defaults:
+      agg_time_dimension: corrected_at
+    dimensions:
+      - name: corrected_at
+        type: time
+        type_params:
+          time_granularity: day
+      - name: run_id
+        type: categorical
+      - name: dataset
+        type: categorical
+      - name: correction_type
+        type: categorical
+      - name: action
+        type: categorical
+      - name: outcome
+        type: categorical
+      - name: corrected_by
+        type: categorical
+        expr: '"user"'
+    measures:
+      - name: corrections
+        agg: count
+        expr: record_id
+
+# Run-level figures come from each run's latest round (the counts of dq_run
+# are running totals, so the rounds of a run must not be added up).
+metrics:
+  - name: dq_processed_records
+    label: Processed records
+    type: simple
+    type_params:
+      measure: processed_records
+    filter: "{{ Dimension('run_round__is_latest_round') }} = true"
+
+  - name: dq_valid_records
+    label: Valid records
+    type: simple
+    type_params:
+      measure: valid_records
+    filter: "{{ Dimension('run_round__is_latest_round') }} = true"
+
+  - name: dq_auto_fixed_records
+    label: Auto-fixed records
+    type: simple
+    type_params:
+      measure: auto_fixed_records
+    filter: "{{ Dimension('run_round__is_latest_round') }} = true"
+
+  - name: dq_quarantined_records
+    label: Quarantined records
+    type: simple
+    type_params:
+      measure: quarantined_records
+    filter: "{{ Dimension('run_round__is_latest_round') }} = true"
+
+  - name: dq_records_with_issues
+    label: Records with issues
+    type: simple
+    type_params:
+      measure: records_with_issues
+    filter: "{{ Dimension('run_round__is_latest_round') }} = true"
+
+  - name: dq_resolved_records
+    label: Resolved records
+    type: simple
+    type_params:
+      measure: resolved_records
+    filter: "{{ Dimension('run_round__is_latest_round') }} = true"
+
+  - name: dq_manually_fixed_records
+    label: Manually fixed records
+    type: simple
+    type_params:
+      measure: manually_fixed_records
+    filter: "{{ Dimension('run_round__is_latest_round') }} = true"
+
+  - name: dq_confirmed_records
+    label: Confirmed after review
+    type: simple
+    type_params:
+      measure: confirmed_records
+    filter: "{{ Dimension('run_round__is_latest_round') }} = true"
+
+  - name: dq_discarded_records
+    label: Discarded records
+    type: simple
+    type_params:
+      measure: discarded_records
+    filter: "{{ Dimension('run_round__is_latest_round') }} = true"
+
+  - name: dq_unresolved_records
+    label: Unresolved records
+    type: simple
+    type_params:
+      measure: unresolved_records
+    filter: "{{ Dimension('run_round__is_latest_round') }} = true"
+
+  - name: dq_valid_or_resolved_records
+    label: Valid or resolved records
+    type: simple
+    type_params:
+      measure: valid_or_resolved_records
+    filter: "{{ Dimension('run_round__is_latest_round') }} = true"
+
+  - name: dq_initial_score
+    label: Initial DQ score
+    description: valid / processed.
+    type: ratio
+    type_params:
+      numerator: dq_valid_records
+      denominator: dq_processed_records
+
+  - name: dq_final_score
+    label: Final DQ score
+    description: (valid + resolved) / processed.
+    type: ratio
+    type_params:
+      numerator: dq_valid_or_resolved_records
+      denominator: dq_processed_records
+
+  - name: dq_auto_fix_rate
+    label: Auto-fix rate
+    description: Share of the records with issues that were fixed automatically.
+    type: ratio
+    type_params:
+      numerator: dq_auto_fixed_records
+      denominator: dq_records_with_issues
+
+  - name: dq_resolution_rate
+    label: Resolution rate
+    description: Share of the quarantined records resolved so far.
+    type: ratio
+    type_params:
+      numerator: dq_resolved_records
+      denominator: dq_quarantined_records
+
+  - name: dq_rule_checks
+    label: Rule checks
+    type: simple
+    type_params:
+      measure: rule_checks
+
+  - name: dq_rule_failures
+    label: Rule failures
+    type: simple
+    type_params:
+      measure: rule_failures
+
+  - name: dq_rule_repairs
+    label: Rule repairs
+    type: simple
+    type_params:
+      measure: rule_repairs
+
+  - name: dq_rule_failure_rate
+    label: Rule failure rate
+    description: Failed / checked values.
+    type: ratio
+    type_params:
+      numerator: dq_rule_failures
+      denominator: dq_rule_checks
+
+  - name: dq_rule_repair_rate
+    label: Rule repair rate
+    description: Repaired / failed values.
+    type: ratio
+    type_params:
+      numerator: dq_rule_repairs
+      denominator: dq_rule_failures
+
+  - name: dq_corrections
+    label: Corrections
+    type: simple
+    type_params:
+      measure: corrections
+
+  - name: dq_manual_corrections
+    label: Manual corrections
+    type: simple
+    type_params:
+      measure: corrections
+    filter: "{{ Dimension('correction__correction_type') }} = 'manual'"
+
+  - name: dq_automatic_corrections
+    label: Automatic corrections
+    type: simple
+    type_params:
+      measure: corrections
+    filter: "{{ Dimension('correction__correction_type') }} = 'automatic'"

@@ -1,0 +1,32 @@
+version: 2
+
+sources:
+  - name: dq
+    description: What the data-quality steps store (sql/02_dq.sql).
+    schema: dq
+    tables:
+      - name: round_result
+        description: Summary of every round (JSON); round 1 is the validation.
+      - name: remediation_audit
+        description: Every automatic repair, per round.
+      - name: quarantine_status
+        description: The ledger, one row per quarantined record.
+      - name: quarantine_history
+        description: Every status change of the ledger, in order (history_id).
+      - name: correction
+        description: Manual corrections applied when a round is re-validated.
+      - name: correction_log
+        description: Every manual correction ever imported, in order (log_id).
+
+  - name: gold
+    description: >
+      Star schema built by gold.py (one fact table per dataset grain). The
+      business models below are written for the banking_transactions
+      dataset (grain: transaction).
+    schema: gold
+    tables:
+      - name: fact_transaction
+      - name: dim_account
+      - name: dim_customer
+      - name: dim_branch
+      - name: dim_bank

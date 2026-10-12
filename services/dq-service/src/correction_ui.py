@@ -17,7 +17,7 @@ Pages
     My changes     everything you changed; check it and send it
     Progress       what is fixed, removed, still waiting; "Publish to clean
                    data" runs the merge (merge.py) and the metric tables
-                   (metrics.py)
+                   (python dq.py metrics: dbt)
     Upload a file  download the list of problems, fill it in (e.g. in
                    Excel), upload it; it is checked before anything is sent
 
@@ -32,6 +32,7 @@ from __future__ import annotations
 import argparse
 import getpass
 import re
+import subprocess
 import sys
 from dataclasses import dataclass
 from datetime import date, datetime
@@ -53,9 +54,8 @@ from correction_assist import (
     field_input,
     lower_label,
 )
-from dq_engine import DEFAULT_RULES
+from dq_engine import DEFAULT_RULES, PROJECT_ROOT as ROOT
 from merge import merge_run
-from metrics import export_metrics
 from layout import (
     Layout,
     current_round,
@@ -850,6 +850,18 @@ def when(timestamp: str) -> str:
     return datetime.fromisoformat(timestamp).astimezone().strftime("%d %b %Y, %H:%M")
 
 
+def refresh_metrics() -> None:
+    """Rebuild the metric tables (python dq.py metrics, which runs dbt)."""
+
+    done = subprocess.run(
+        [sys.executable, str(ROOT / "dq.py"), "metrics"],
+        cwd=ROOT, capture_output=True, text=True,
+    )
+    if done.returncode:
+        raise RuntimeError("Updating the metric tables failed:\n"
+                           + (done.stdout + done.stderr)[-2000:])
+
+
 def publish(ctx: Context) -> None:
     """Merge into the clean data and refresh the metric tables."""
 
@@ -857,7 +869,7 @@ def publish(ctx: Context) -> None:
         st.write("Adding the fixed records to the clean data...")
         summary = merge_run(ctx.layout, ctx.registry, published_by=ctx.user)
         st.write("Updating the quality figures for Power BI...")
-        export_metrics(ctx.layout.dataset)
+        refresh_metrics()
         progress.update(label="Published", state="complete")
 
     st.session_state["last_publish"] = summary

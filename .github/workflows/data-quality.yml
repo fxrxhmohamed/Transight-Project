@@ -54,6 +54,20 @@ jobs:
                                 -r services/dq-service/requirements.txt \
                                 pytest
 
+      # dbt and MetricFlow (the metrics step) in their own environment, as
+      # in the images: they do not share the pipeline's pinned pandas/numpy.
+      - name: Install dbt
+        run: |
+          python -m venv "$RUNNER_TEMP/dbt"
+          "$RUNNER_TEMP/dbt/bin/pip" install -r dbt/requirements.txt
+          echo "DBT=$RUNNER_TEMP/dbt/bin/dbt" >> "$GITHUB_ENV"
+
+      - name: Check the dbt project and the semantic layer
+        working-directory: dbt
+        run: |
+          "$RUNNER_TEMP/dbt/bin/dbt" parse --profiles-dir .
+          "$RUNNER_TEMP/dbt/bin/mf" validate-configs --skip-dw
+
       # 50-row test dataset with one example of each defect, run through
       # every step of dq.py (tests/test_pipeline.py).
       - name: Test the data-quality flow

@@ -15,8 +15,9 @@ does in Airflow exactly what the same command does by hand.
                           Puts the records fixed in the correction UI that
                           day into the clean data and the gold star schema.
 
-The data work of every step runs on Spark: the tasks submit their jobs to
-the cluster named by SPARK_MASTER (docker-compose.yml).
+The data work of the steps runs on Spark: the tasks submit their jobs to
+the cluster named by SPARK_MASTER (docker-compose.yml). metrics, and the
+business marts after gold, are dbt models run in PostgreSQL (dbt/).
 
 Environment of the Airflow workers
     METAFLOW_HOME    project folder holding dq.py and config/
@@ -24,6 +25,7 @@ Environment of the Airflow workers
     METAFLOW_PYTHON  Python with the services' requirements and PySpark
                      (default python)
     SPARK_MASTER     spark://spark-master:7077, or local[*]
+    DBT              dbt executable (default: dbt on the PATH)
     POSTGRES_*       the database every step reads and writes
 """
 
