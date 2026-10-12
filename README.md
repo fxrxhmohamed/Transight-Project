@@ -1,17 +1,24 @@
-# MetaFlow-DQ
+# Transight
 
-Metadata-driven data quality and ETL for the Egypt banking transactions
-dataset.
+**See beyond the transaction.**
+
+Transight is a metadata-driven data quality and ETL platform for the Egypt
+banking transactions dataset. It takes raw transaction files, finds and
+repairs what is wrong with them, lets people fix what cannot be repaired
+automatically, and turns the result into a clean star schema with
+data-quality and business metrics for Power BI.
 
 What the data should look like (columns, types, allowed values, ranges,
 relationships) is described in a schema registry, and how strictly it is
 enforced and repaired in a rules file. The pipeline lands each source file
 unchanged, validates and repairs it, holds back the records it cannot
 trust, lets people correct them (in the browser or with a file), merges
-the result into a clean dataset and reports data-quality metrics for
-Power BI. Every record keeps one id from ingestion to the final dataset.
-Everything is stored in PostgreSQL; the only files are the source CSV and
-the correction templates people fill in.
+the result into a clean dataset, describes it and builds a gold star
+schema from that description. Every record keeps one id from ingestion to
+the final dataset. The data work runs on Apache Spark (PySpark), the
+metric tables and business marts are dbt models, and everything is
+stored in PostgreSQL; the only files are the source CSV and the
+correction templates people fill in.
 
 ```
 source CSV
@@ -29,9 +36,9 @@ source CSV
 ## Project structure
 
 ```
-MetaFlow-DQ/
+Transight/
 ├── dq.py                        one command per pipeline step (python dq.py --help)
-├── docker-compose.yml           PostgreSQL + Airflow for local use
+├── docker-compose.yml           PostgreSQL, Spark cluster, Airflow, correction UI
 ├── .env.example                 database settings (copy to .env)
 │
 ├── config/
@@ -41,12 +48,18 @@ MetaFlow-DQ/
 │
 ├── sql/
 │   ├── 01_bronze.sql            bronze schema (ingestion catalog, append-only)
-│   └── 02_dq.sql                dq, silver and metrics schemas
+│   ├── 02_dq.sql                dq and silver schemas
+│   └── 03_meta_gold.sql         meta and gold schemas
 │
 ├── services/
+│   ├── common/src/              shared by every step
+│   │   ├── spark_io.py          Spark session and PostgreSQL (JDBC) access
+│   │   ├── bronze.py            bronze database client
+│   │   └── schemas.py           create missing schemas on first use
 │   ├── ingestion-service/src/   ingest.py   load a CSV into bronze
-│   │                            bronze.py   bronze database client (shared)
 │   ├── metadata-service/src/    profiler.py profile an ingestion
+│   │                            metadata.py describe silver in the meta schema
+│   ├── etl-service/src/         gold.py     build the gold star schema (AutoETL)
 │   └── dq-service/src/
 │       ├── dq_engine.py         validate: valid | quarantine | repair audit
 │       ├── registry.py          load the schema registry and rules
@@ -67,6 +80,7 @@ MetaFlow-DQ/
 │   ├── models/semantic/         time spine for MetricFlow
 │   └── requirements.txt         dbt-core, dbt-postgres, dbt-metricflow
 │
+├── docker/pipeline.Dockerfile   pipeline image: Python 3.12, Java 17, PySpark, dbt
 ├── airflow/
 │   ├── Dockerfile               Airflow image with the pipeline's Python
 │   └── dags/data_quality.py     DAGs, one dq.py step per task
@@ -79,19 +93,30 @@ MetaFlow-DQ/
 └── data/raw/banking/            source files to ingest (local, not in git)
 ```
 
-Each service has its own `Dockerfile` and `requirements.txt`. Records are
-identified by `<ingestion id>_ROW_<row number>` from ingestion to the
-clean data.
+The ingestion, metadata and dq services each have their own
+`requirements.txt`; one Docker image (`docker/pipeline.Dockerfile`) runs
+them all. Records are identified by `<ingestion id>_ROW_<row number>` from
+ingestion to the clean data. Internal names (the `metaflow` database and
+user, `/opt/metaflow`, the `METAFLOW_*` variables) predate the Transight
+name and are kept so existing databases and settings keep working.
 
 ## Setup
 
-Python 3.13 (what CI tests with). From the project root:
+The easiest way is Docker, which has everything already (see
+[Docker](#docker)). To run the steps on your own machine instead you need:
+
+- Python 3.12 (what CI and the Docker images use; 3.13 also installs)
+- Java 17, for Spark (e.g. Eclipse Temurin), with `JAVA_HOME` set
+- PostgreSQL 14 or later (see [Setting it up](#setting-it-up))
+
+From the project root:
 
 ```bash
 python -m venv .venv
 # Windows: .venv\Scripts\activate      Linux/macOS: source .venv/bin/activate
-python -m pip install -r services/dq-service/requirements.txt \
-                      -r services/metadata-service/requirements.txt
+python -m pip install -r services/ingestion-service/requirements.txt \
+                      -r services/metadata-service/requirements.txt \
+                      -r services/dq-service/requirements.txt
 
 # dbt and MetricFlow (metrics step) in a virtual environment of their own:
 python -m venv .venv-dbt
@@ -145,11 +170,32 @@ data column (values as the engine cleaned them):
 | `dq.round_result` | round of a run: its summary (JSON) |
 | `silver.<dataset>` | record of the clean data: valid + resolved, per run |
 | `dq.merge_result` | run: counts and checks of its latest merge |
-| `metrics.*` | see [Data quality metrics](#data-quality-metrics) |
+| `metrics.*` | dbt models, see [Data quality metrics](#data-quality-metrics) |
 
 Each step writes its tables in one transaction, so a step that fails
-leaves nothing half written. Older database volumes get the `dq` tables
-on the first run of a step.
+leaves nothing half written. Older database volumes get any missing
+schema on the first run of a step (`services/common/src/schemas.py`).
+
+### Metadata and gold
+
+`sql/03_meta_gold.sql` creates the `meta` and `gold` schemas. The metadata
+step combines the schema registry with what silver actually holds; the
+gold step (AutoETL) builds a star schema from that description, with no
+code per dataset:
+
+| Table | One row per |
+|---|---|
+| `meta.dataset` | dataset: its silver table, rows, runs, grain, primary key |
+| `meta.column` | silver column: type, role, entity, PII, nulls, distinct values, min, max |
+| `meta.entity` | entity: key, attributes, distinct keys |
+| `meta.relationship` | reference between entities, with the keys whose reference is empty |
+| `gold.fact_<grain entity>` | record of the grain (latest run), with the key of every other entity and `run_id` / `record_id` for lineage |
+| `gold.dim_<entity>` | key of every other entity, from its most recent record |
+| `gold.dim_date` | day the facts cover |
+| `marts.*` | dbt views over gold, see [Business marts](#business-marts) |
+
+Gold is rebuilt and swapped in whole on every run, so Power BI never sees
+a half-built star.
 
 ### Setting it up
 
@@ -167,6 +213,7 @@ psql -U postgres -c "CREATE ROLE metaflow LOGIN CREATEDB PASSWORD 'change_me_loc
 psql -U postgres -c "CREATE DATABASE metaflow OWNER metaflow"
 psql -U metaflow -d metaflow -f sql/01_bronze.sql
 psql -U metaflow -d metaflow -f sql/02_dq.sql
+psql -U metaflow -d metaflow -f sql/03_meta_gold.sql
 ```
 
 The scripts connect with `POSTGRES_HOST`, `POSTGRES_PORT`, `POSTGRES_DB`,
@@ -202,7 +249,9 @@ are; delete `data/validated`, `quarantine`, `corrected`, `quality`,
 ## Run the pipeline
 
 Every step is one command of `dq.py`, run from the project root. Each
-calls the service script that does the work (`python dq.py --help`).
+calls the service script that does the work (`python dq.py --help`). With
+Docker, put `docker compose run --rm pipeline` in front of each command
+(e.g. `docker compose run --rm pipeline python dq.py validate`).
 
 ```bash
 # 1. Ingest: load into bronze with an ingestion id and record ids
@@ -229,10 +278,16 @@ python dq.py status
 #    one row per record
 python dq.py merge
 
-# 8. Data-quality metric tables for Power BI (metrics schema, all runs)
+# 8. Data-quality metric tables for Power BI (metrics schema, all runs; dbt)
 python dq.py metrics
 
-# Steps 1, 2, 3-4, 7 and 8 in one go
+# 9. Describe silver in the meta schema
+python dq.py metadata
+
+# 10. Build the gold star schema from the metadata, then the marts (dbt)
+python dq.py gold
+
+# Steps 1, 2, 3-4 and 7-10 in one go
 python dq.py pipeline --input data/raw/banking/banking_transactions.csv
 ```
 
@@ -288,6 +343,32 @@ python dq.py ui
 The wording and suggestions come from the schema registry
 (`correction_assist.py`), so they follow the dataset without code changes.
 
+## Docker
+
+`docker-compose.yml` runs everything locally:
+
+| Service | What | Address |
+|---|---|---|
+| `postgres` | PostgreSQL 17 with every schema (`sql/` runs on first start) | `localhost:5432` |
+| `spark-master`, `spark-worker` | Spark standalone cluster that Airflow submits the steps to | http://localhost:8081 |
+| `airflow` | Airflow 3, no login (local development only) | http://localhost:8080 |
+| `ui` | correction UI (`UI_PORT` in `.env` to change) | http://localhost:8501 |
+| `pipeline` | runtime for `dq.py` and the tests; only started by `docker compose run` | |
+
+```bash
+cp .env.example .env                      # optional: change the password here
+docker compose --progress plain build pipeline   # first: the pipeline image (PySpark ~450 MB)
+docker compose --progress plain build            # then the Airflow image, built from it
+docker compose up -d                      # start everything
+docker compose run --rm pipeline python dq.py pipeline \
+    --input data/raw/banking/banking_transactions.csv
+docker compose down                       # stop; data stays in the volumes
+```
+
+The project folder is mounted at `/opt/metaflow` in every container
+(code, config, source files); every result is stored in the `postgres`
+service.
+
 ## Airflow
 
 `airflow/dags/data_quality.py`; every task runs one `dq.py` step.
@@ -298,22 +379,13 @@ The wording and suggestions come from the schema registry
 | `dq_apply_corrections` | import-corrections, revalidate, merge, metrics, metadata, gold | a filled-in correction file; params `run`, `file` |
 | `dq_publish` | merge, metrics, metadata, gold | every day at 18:00 (records fixed in the UI) |
 
-Locally with Docker (Airflow 3, no login, for development only):
-
-```bash
-docker compose --progress plain build    # first time: several minutes
-docker compose up -d                     # http://localhost:8080
-docker compose down                      # stop; data stays in the
-                                         # postgres-data volume
-```
-
-The project folder is mounted at `/opt/metaflow` (code, config, source
-files), and the DAGs use the same database as the commands and the UI.
-The pipeline runs in its own
-virtual environment inside the image, dbt in another (`/opt/dbt`).
-Elsewhere, Airflow workers need `METAFLOW_HOME` (the project folder),
+With Docker (above), Airflow is at http://localhost:8080 and its tasks
+send their Spark jobs to the `spark-master` service. The DAGs use the same
+database as the commands and the UI. The pipeline runs in its own virtual
+environment inside the image, dbt in another (`/opt/dbt`). Elsewhere,
+Airflow workers need `METAFLOW_HOME` (the project folder),
 `METAFLOW_PYTHON` (a Python with the requirements above), `DBT` (the dbt
-executable) and the `POSTGRES_*` variables.
+executable), Java 17 and the `POSTGRES_*` variables.
 
 ## Tests and CI
 
@@ -328,6 +400,9 @@ and checks each defect.
 python -m pip install pytest
 docker compose up -d postgres     # the tests need PostgreSQL
 python -m pytest tests
+
+# or entirely in Docker (Java and dbt included):
+docker compose run --rm pipeline python -m pytest tests
 ```
 
 The tests create a temporary database (`metaflow_test_*`) and drop it at
@@ -348,6 +423,20 @@ rebuilds the dataset from a validated run.
 Severity decides what happens to a record that still fails after
 repair: `critical` -> quarantine, `warning` -> accepted and flagged,
 `info` -> counted only.
+
+Environment variables (in `.env` or the environment):
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `POSTGRES_HOST`, `_PORT`, `_DB`, `_USER`, `_PASSWORD` | as in `.env.example` | database connection |
+| `METAFLOW_DB_URL` | | one libpq URL instead of the `POSTGRES_*` settings |
+| `SPARK_MASTER` | `local[*]` | or `spark://spark-master:7077` for the cluster |
+| `SPARK_DRIVER_MEMORY` | `4g` | local mode runs everything in the driver |
+| `SPARK_EXECUTOR_MEMORY` | `2g` | cluster mode |
+| `SPARK_SHUFFLE_PARTITIONS` | `16` | |
+| `SPARK_DRIVER_HOST` | | address executors use to reach the driver (cluster) |
+| `METAFLOW_JDBC_JAR` | `/opt/jars/postgresql.jar` | PostgreSQL JDBC driver; downloaded from Maven when missing |
+| `DBT` | `dbt` on the PATH | dbt executable for the metrics and gold steps |
 
 ## Data quality metrics
 
