@@ -1,4 +1,4 @@
-"""Lineage and DQ metrics: four tables in PostgreSQL for Power BI.
+"""Lineage and DQ metrics: four tables in PostgreSQL for Power BI (PySpark).
 
 Built from what every step stores in the dq schema (the summary of every
 round, remediation audits, the quarantine history, corrections and the
@@ -12,7 +12,9 @@ correction log), for every run of the dataset:
                     correction (correction log), with its outcome
 
 stored in metrics.<table>. The rows of the runs being measured are
-replaced each time, so the tables always match the dq schema.
+replaced each time, so the tables always match the dq schema. The large
+inputs (repair audits, the ledger history, the correction log) are read
+and joined in Spark; the per-round counts come from the round results.
 
 Definitions (dq_run)
 --------------------
@@ -50,12 +52,14 @@ import sys
 from pathlib import Path
 from typing import Any
 
-import pandas as pd
 from psycopg import sql
+from pyspark.sql import DataFrame
+from pyspark.sql import functions as F
 
 import db
 from dq_engine import DEFAULT_RULES
 from layout import (
+    AUDIT_COLUMNS,
     DISCARDED,
     MANUAL_REVIEW,
     OPEN,
@@ -63,31 +67,36 @@ from layout import (
     Layout,
     LayoutError,
     list_runs,
-    load_history,
 )
 from registry import ConfigError, load_registry
+from values import lit
 
+spark_io = db.spark_io
 
 TABLES = ("dq_run", "dq_rule_result", "dq_quarantine", "dq_correction")
 
 # Audit outcomes that count as an automatic fix.
 AUTO_FIX_OUTCOMES = ("remediated", "nullified_in_accepted")
 
-RULE_COLUMNS = [
-    "run_id", "dataset", "round", "round_type", "rule_id", "rule_name",
-    "rule_type", "column", "dimension", "severity", "error_code",
-    "error_category", "origin", "checked", "failed", "repaired",
-    "unresolved",
-]
-QUARANTINE_COLUMNS = [
-    "run_id", "dataset", "record_id", "sequence", "round", "status",
-    "previous_status", "attempts", "changed_at",
-]
-CORRECTION_COLUMNS = [
-    "run_id", "dataset", "round", "record_id", "column", "correction_type",
-    "action", "rule_id", "old_value", "new_value", "outcome", "reason",
-    "user", "corrected_at",
-]
+RUN_SCHEMA = (
+    "run_id string, dataset string, source_file string, ingested_at string, "
+    "schema_version string, rules_version string, input_rows long, "
+    "duplicate_rows_removed long, processed long, valid long, valid_with_warnings long, "
+    "auto_fixed_records long, quarantined long, records_with_issues long, "
+    "initial_dq_score double, round int, round_type string, revalidated_round int, "
+    "started_at string, finished_at string, round_open_before long, "
+    "round_revalidated long, round_resolved long, round_failed_again long, "
+    "round_manual_review long, round_discarded long, resolved long, "
+    "manually_fixed_records long, confirmed_records long, auto_resolved_records long, "
+    "discarded long, manual_review long, open long, unresolved_records long, "
+    "final_dq_score double"
+)
+RULE_SCHEMA = (
+    "run_id string, dataset string, round int, round_type string, rule_id string, "
+    "rule_name string, rule_type string, column string, dimension string, "
+    "severity string, error_code string, error_category string, origin string, "
+    "checked long, failed long, repaired long, unresolved long"
+)
 
 MANUAL_OUTCOMES = {
     RESOLVED: "resolved",
@@ -95,6 +104,13 @@ MANUAL_OUTCOMES = {
     MANUAL_REVIEW: "manual_review_required",
     DISCARDED: "discarded",
 }
+
+
+def _frame(rows: list[dict[str, Any]], schema: str) -> DataFrame:
+    """Rows (dicts) as a Spark DataFrame with the given schema."""
+
+    names = [field.strip().split(" ")[0] for field in schema.split(",")]
+    return spark_io.local_frame([tuple(row.get(n) for n in names) for row in rows], schema)
 
 
 # ============================================================
@@ -114,26 +130,32 @@ def score(part: int, whole: int) -> float:
     return round(part / whole, 6) if whole else 0.0
 
 
+def _record_ids(layout: Layout, kind: str, round_number: int) -> DataFrame:
+    table = db.qualified(*db.record_table_name(layout.dataset, kind))
+    return spark_io.read(
+        f"SELECT record_id FROM {table} WHERE run_id = {db.literal(layout.run_id)} "
+        f"AND round = {int(round_number)}",
+    )
+
+
 # ============================================================
 # Tables
 # ============================================================
 
-def run_table(
-    layout: Layout,
-    rounds: dict[int, dict[str, Any]],
-) -> pd.DataFrame:
+def run_table(layout: Layout, rounds: dict[int, dict[str, Any]]) -> list[dict[str, Any]]:
     first = rounds[1]
     counts = first["counts"]
     processed = counts["processed_rows"]
     valid = counts["accepted_rows"]
     quarantined = counts["quarantined_rows"]
 
-    quarantined_ids = set(layout.load_quarantine(1, columns=[])["record_id"])
-
-    audit = layout.load_audit(1)
-    fixed = audit[audit["outcome"].isin(AUTO_FIX_OUTCOMES)]
-    auto_fixed = int(
-        fixed.loc[~fixed["record_id"].isin(quarantined_ids), "record_id"].nunique()
+    outcomes = ", ".join(lit(o) for o in AUTO_FIX_OUTCOMES)
+    fixed = layout.spark_table("dq.remediation_audit", ["record_id"], 1,
+                               where=f"outcome IN ({outcomes})")
+    auto_fixed = (
+        fixed.distinct()
+        .join(_record_ids(layout, "quarantine", 1), "record_id", "left_anti")
+        .count()
     )
 
     base = {
@@ -141,8 +163,8 @@ def run_table(
         "dataset": layout.dataset,
         "source_file": first.get("source_file"),
         "ingested_at": (first.get("ingestion") or {}).get("ingested_at"),
-        "schema_version": first.get("config", {}).get("schema_version"),
-        "rules_version": first.get("config", {}).get("rules_version"),
+        "schema_version": str(first.get("config", {}).get("schema_version")),
+        "rules_version": str(first.get("config", {}).get("rules_version")),
         "input_rows": counts["input_rows"],
         "duplicate_rows_removed": counts["duplicate_rows_removed"],
         "processed": processed,
@@ -154,23 +176,19 @@ def run_table(
         "initial_dq_score": score(valid, processed),
     }
 
-    resolved_by_round = dict(layout.load_resolved())
     rows = []
     resolved_total = manual_fixed = confirmed = 0
     discarded_total = manual_review_total = 0
     open_records = quarantined
 
     for number, result in rounds.items():
-        row = {**base, "round": number}
+        row = {**base, "round": number,
+               "started_at": result.get("started_at"),
+               "finished_at": result.get("finished_at")}
 
         if number == 1:
-            row.update(
-                round_type="validation",
-                revalidated_round=None,
-                started_at=result.get("started_at"),
-                finished_at=result.get("finished_at"),
-            )
-            round_counts = {}
+            row.update(round_type="validation", revalidated_round=None)
+            round_counts: dict[str, Any] = {}
         else:
             round_counts = result["counts"]
             k = result["revalidated_round"]
@@ -182,8 +200,8 @@ def run_table(
             fixed_ids = ids_with("FIX")
             accepted_ids = ids_with("ACCEPT") - fixed_ids
             resolved_ids = (
-                set(resolved_by_round[k]["record_id"]) if k in resolved_by_round
-                else set()
+                {r["record_id"] for r in _record_ids(layout, "resolved", k).collect()}
+                if layout.has_records("resolved") else set()
             )
 
             resolved_total += round_counts["resolved"]
@@ -194,13 +212,7 @@ def run_table(
             )
             manual_review_total += round_counts["manual_review_required"]
             open_records = round_counts["open_after"]
-
-            row.update(
-                round_type="revalidation",
-                revalidated_round=k,
-                started_at=result.get("started_at"),
-                finished_at=result.get("finished_at"),
-            )
+            row.update(round_type="revalidation", revalidated_round=k)
 
         row.update(
             round_open_before=round_counts.get("open_before"),
@@ -222,26 +234,16 @@ def run_table(
             unresolved_records=open_records + manual_review_total,
             final_dq_score=score(valid + resolved_total, processed),
         )
+        if row["resolved"] + row["discarded"] + row["unresolved_records"] != quarantined:
+            raise ConfigError(
+                f"Run {layout.run_id}: resolved + discarded + unresolved does not "
+                f"add up to the {quarantined} quarantined records."
+            )
         rows.append(row)
-
-    table = pd.DataFrame(rows)
-    integer_columns = [
-        "revalidated_round", "round_open_before", "round_revalidated",
-        "round_resolved", "round_failed_again", "round_manual_review",
-        "round_discarded",
-    ]
-    table[integer_columns] = table[integer_columns].astype("Int64")
-
-    balance = table["resolved"] + table["discarded"] + table["unresolved_records"]
-    if not balance.eq(quarantined).all():
-        raise ConfigError(
-            f"Run {layout.run_id}: resolved + discarded + unresolved does not "
-            f"add up to the {quarantined} quarantined records."
-        )
-    return table
+    return rows
 
 
-def rule_table(layout: Layout, rounds: dict[int, dict[str, Any]]) -> pd.DataFrame:
+def rule_table(layout: Layout, rounds: dict[int, dict[str, Any]]) -> list[dict[str, Any]]:
     rows = []
     for number, result in rounds.items():
         for stats in result.get("rules", []):
@@ -264,103 +266,91 @@ def rule_table(layout: Layout, rounds: dict[int, dict[str, Any]]) -> pd.DataFram
                 "repaired": stats["remediated"],
                 "unresolved": stats["unresolved"],
             })
-    return pd.DataFrame(rows, columns=RULE_COLUMNS)
+    return rows
 
 
-def quarantine_table(layout: Layout, history: pd.DataFrame) -> pd.DataFrame:
-    history = history.reset_index(drop=True)
-    by_record = history.groupby("record_id", sort=False)
-    history = history.assign(
-        run_id=layout.run_id,
-        dataset=layout.dataset,
-        sequence=by_record.cumcount() + 1,
-        previous_status=by_record["status"].shift(),
+def _history(layout: Layout) -> DataFrame:
+    return layout.spark_table(
+        "dq.quarantine_history",
+        ["history_id", "record_id", "status", "round", "attempts", "changed_at"],
     )
-    return history.sort_values(
-        ["record_id", "sequence"], ignore_index=True,
-    )[QUARANTINE_COLUMNS]
 
 
-def correction_table(
-    layout: Layout,
-    rounds: dict[int, dict[str, Any]],
-    history: pd.DataFrame,
-) -> pd.DataFrame:
-    parts = []
+def quarantine_table(layout: Layout) -> DataFrame:
+    """Every status change of every quarantined record, numbered per record."""
 
-    # ---- Automatic repairs ----
-    for number, result in rounds.items():
-        audit = layout.load_audit(number)
-        if not len(audit):
-            continue
-        parts.append(pd.DataFrame({
-            "round": number,
-            "record_id": audit["record_id"],
-            "column": audit["column"],
-            "correction_type": "automatic",
-            "action": audit["action"],
-            "rule_id": audit["rule_id"],
-            "old_value": audit["original_value"],
-            "new_value": audit["cleaned_value"],
-            "outcome": audit["outcome"],
-            "reason": pd.NA,
-            "user": "dq_engine",
-            "corrected_at": result.get("finished_at"),
-        }))
+    return _history(layout).selectExpr(
+        f"{lit(layout.run_id)} AS run_id", f"{lit(layout.dataset)} AS dataset",
+        "record_id",
+        "CAST(row_number() OVER (PARTITION BY record_id ORDER BY history_id) AS INT) "
+        "AS sequence",
+        "round", "status",
+        "lag(status) OVER (PARTITION BY record_id ORDER BY history_id) AS previous_status",
+        "attempts", "changed_at",
+    )
 
-    # ---- Manual corrections ----
-    log = layout.load_log()
-    if len(log):
-        log = log.assign(round=log["round"].astype(int))
 
-        # The record's status right after its round was re-validated.
-        after = []
-        for result in rounds.values():
-            if "revalidated_round" not in result:
-                continue
-            changed = history[history["changed_at"].eq(result["finished_at"])]
-            after.append(pd.DataFrame({
-                "record_id": changed["record_id"],
-                "round": result["revalidated_round"],
-                "status_after": changed["status"],
-            }))
-        outcome = (
-            pd.concat(after, ignore_index=True).drop_duplicates(["record_id", "round"])
-            if after else pd.DataFrame(columns=["record_id", "round", "status_after"])
+def correction_table(layout: Layout, rounds: dict[int, dict[str, Any]]) -> DataFrame:
+    """Automatic repairs and manual corrections, with their outcome."""
+
+    finished = spark_io.local_frame(
+        [(n, r.get("finished_at"), r.get("revalidated_round")) for n, r in rounds.items()],
+        "round int, finished_at string, revalidated_round int",
+    ).selectExpr("round", "CAST(finished_at AS TIMESTAMP) AS finished_at",
+                 "revalidated_round")
+
+    # ---- Automatic repairs: the audit of every round ----
+    automatic = (
+        layout.spark_table("dq.remediation_audit", ["round", *AUDIT_COLUMNS])
+        .join(F.broadcast(finished.select("round", "finished_at")), "round", "left")
+        .selectExpr(
+            "round", "record_id", "`column`", "'automatic' AS correction_type", "action",
+            "rule_id", "original_value AS old_value", "cleaned_value AS new_value",
+            "outcome", "CAST(NULL AS STRING) AS reason", "'dq_engine' AS `user`",
+            "finished_at AS corrected_at",
         )
-        log = log.merge(
-            outcome.astype({"round": int}), on=["record_id", "round"], how="left",
-        )
-        log["outcome"] = log["status_after"].map(MANUAL_OUTCOMES).fillna("pending")
+    )
 
+    # ---- Manual corrections: the record's status right after its round
+    # was re-validated ----
+    after = (
+        _history(layout)
+        .join(F.broadcast(finished.filter("revalidated_round IS NOT NULL")),
+              F.col("changed_at") == F.col("finished_at"))
+        .selectExpr("record_id", "revalidated_round AS round", "status AS status_after")
+        .dropDuplicates(["record_id", "round"])
+    )
+    outcome = "CASE " + " ".join(
+        f"WHEN status_after = {lit(status)} THEN {lit(name)}"
+        for status, name in MANUAL_OUTCOMES.items()
+    ) + " ELSE 'pending' END"
+    log = spark_io.read(
+        "SELECT log_id, round, record_id, \"column\", old_value, new_value, action, "
+        "reason, \"user\", corrected_at FROM dq.correction_log "
+        f"WHERE dataset = {db.literal(layout.dataset)} AND run_id = {db.literal(layout.run_id)}"
+    )
+    manual = log.join(after, ["record_id", "round"], "left").selectExpr(
+        "round", "record_id", "`column`", "'manual' AS correction_type", "action",
+        "CAST(NULL AS STRING) AS rule_id", "old_value", "new_value",
         # A field corrected again in the same round: only the newest line
         # was applied.
-        superseded = log.duplicated(
-            ["round", "record_id", "column", "action"], keep="last",
-        )
-        log.loc[superseded, "outcome"] = "superseded"
+        "CASE WHEN row_number() OVER (PARTITION BY round, record_id, `column`, action "
+        f"ORDER BY log_id DESC) > 1 THEN 'superseded' ELSE {outcome} END AS outcome",
+        "reason", "`user`", "corrected_at",
+    )
 
-        parts.append(log.assign(
-            correction_type="manual", rule_id=pd.NA,
-        ).drop(columns="status_after"))
-
-    if not parts:
-        return pd.DataFrame(columns=CORRECTION_COLUMNS)
-
-    table = pd.concat(parts, ignore_index=True)
-    table["run_id"] = layout.run_id
-    table["dataset"] = layout.dataset
-    return table[CORRECTION_COLUMNS]
+    return automatic.unionByName(manual).selectExpr(
+        f"{lit(layout.run_id)} AS run_id", f"{lit(layout.dataset)} AS dataset", "*",
+    )
 
 
-def build_tables(layout: Layout) -> dict[str, pd.DataFrame]:
+def build_tables(layout: Layout) -> dict[str, Any]:
     rounds = read_rounds(layout)
-    history = load_history(layout)
     return {
         "dq_run": run_table(layout, rounds),
         "dq_rule_result": rule_table(layout, rounds),
-        "dq_quarantine": quarantine_table(layout, history),
-        "dq_correction": correction_table(layout, rounds, history),
+        "dq_quarantine": quarantine_table(layout),
+        "dq_correction": correction_table(layout, rounds),
     }
 
 
@@ -380,37 +370,45 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def export_metrics(
-    dataset: str,
-    runs: list[str] | None = None,
-) -> dict[str, pd.DataFrame]:
+def export_metrics(dataset: str, runs: list[str] | None = None) -> dict[str, Any]:
     """Build the four tables for some runs (default: all) and store them in
-    metrics.<table>, replacing those runs' rows."""
+    metrics.<table>, replacing those runs' rows. Returns the dq_run rows and
+    the number of rows per table."""
 
     every_run = runs is None
     runs = runs or list_runs(dataset)
     if not runs:
         raise LayoutError(f"No validated runs for {dataset}")
 
-    parts: dict[str, list[pd.DataFrame]] = {name: [] for name in TABLES}
-    for run_id in runs:
-        for name, frame in build_tables(Layout(dataset, run_id)).items():
-            if len(frame):
-                parts[name].append(frame)
+    built = [build_tables(Layout(dataset, run_id)) for run_id in runs]
+    run_rows = [row for tables in built for row in tables["dq_run"]]
+    frames = {
+        "dq_run": _frame(run_rows, RUN_SCHEMA),
+        "dq_rule_result": _frame(
+            [row for tables in built for row in tables["dq_rule_result"]], RULE_SCHEMA),
+    }
+    for name in ("dq_quarantine", "dq_correction"):
+        frame = built[0][name]
+        for tables in built[1:]:
+            frame = frame.unionByName(tables[name])
+        frames[name] = frame
 
-    written = {}
     with db.transaction() as conn:
-        for name, frames in parts.items():
+        for name in TABLES:
             table = sql.Identifier("metrics", name)
             if every_run:
                 db.delete(conn, table, {"dataset": dataset})
             else:
                 for run_id in runs:
                     db.delete(conn, table, {"dataset": dataset, "run_id": run_id})
-            frame = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
-            db.write_frame(conn, table, frame)
-            written[name] = frame
-    return written
+
+    counts = {}
+    for name, frame in frames.items():
+        frame = frame.cache()
+        counts[name] = frame.count()
+        spark_io.write(frame, f"metrics.{name}")
+        frame.unpersist()
+    return {"dq_run": run_rows, "counts": counts}
 
 
 def main() -> int:
@@ -420,9 +418,10 @@ def main() -> int:
 
     written = export_metrics(dataset, None if args.run == "all" else [args.run])
 
-    runs = written["dq_run"]
-    for run_id, rows in runs.groupby("run_id", sort=False):
-        last = rows.iloc[-1]
+    last_rows: dict[str, dict[str, Any]] = {}
+    for row in written["dq_run"]:
+        last_rows[row["run_id"]] = row
+    for run_id, last in last_rows.items():
         print(
             f"{run_id} round {last['round']}: {last['records_with_issues']} "
             f"records with issues -> {last['auto_fixed_records']} auto-fixed "
@@ -434,8 +433,8 @@ def main() -> int:
             f"{last['initial_dq_score']:.2%} -> {last['final_dq_score']:.2%}"
         )
 
-    for name, table in written.items():
-        print(f"  metrics.{name:<15} {len(table):>9} rows")
+    for name, rows in written["counts"].items():
+        print(f"  metrics.{name:<15} {rows:>9} rows")
 
     return 0
 
@@ -446,3 +445,5 @@ if __name__ == "__main__":
     except (ConfigError, LayoutError) as error:
         print(f"Error: {error}", file=sys.stderr)
         sys.exit(2)
+    finally:
+        spark_io.stop()

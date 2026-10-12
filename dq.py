@@ -12,19 +12,24 @@ Steps, in pipeline order
     export-template     correction template (CSV) for the open quarantine round
     import-corrections  import a filled-in template (--file)
     revalidate          apply the corrections and validate again
-    merge               valid + resolved records -> silver.<dataset>
+    merge               valid + resolved records -> silver.<dataset> (typed)
     metrics             the DQ metric tables for Power BI (metrics schema)
+    metadata            describe silver in the meta schema (metadata engine)
+    gold                build the gold star schema from the metadata (AutoETL)
     import-files        load runs kept in data/ by earlier versions into
                         the database (once)
 Helpers
     status              quarantine counts per status and round
     ui                  start the correction UI (Streamlit)
-    pipeline            ingest, profile, validate, merge and metrics in one go
+    pipeline            ingest, profile, validate, merge, metrics, metadata
+                        and gold in one go
 
 Every step takes --run (an ingestion id, default 'latest') and --rules,
-and passes the options to the service script that does the work. Every
-step reads and writes PostgreSQL (sql/01_bronze.sql, sql/02_dq.sql); the
-database comes from the POSTGRES_* environment variables (see .env.example):
+and passes the options to the service script that does the work. The
+data work runs on Spark (PySpark, local or SPARK_MASTER); every step reads
+and writes PostgreSQL (sql/*.sql); the database comes from the POSTGRES_*
+environment variables (see .env.example). Run it in the pipeline container
+(docker compose run --rm pipeline python dq.py ...), which has Java:
 
     ingest              services/ingestion-service/src/ingest.py
     profile             services/metadata-service/src/profiler.py
@@ -34,6 +39,8 @@ database comes from the POSTGRES_* environment variables (see .env.example):
     revalidate, status  services/dq-service/src/quarantine.py
     merge               services/dq-service/src/merge.py
     metrics             services/dq-service/src/metrics.py
+    metadata            services/metadata-service/src/metadata.py
+    gold                services/etl-service/src/gold.py
     import-files        services/dq-service/src/import_files.py
 
 Exit code: the step's own (0 = success).
@@ -61,6 +68,8 @@ SERVICES = ROOT / "services"
 
 INGEST = SERVICES / "ingestion-service" / "src" / "ingest.py"
 PROFILER = SERVICES / "metadata-service" / "src" / "profiler.py"
+METADATA = SERVICES / "metadata-service" / "src" / "metadata.py"
+GOLD = SERVICES / "etl-service" / "src" / "gold.py"
 DQ = SERVICES / "dq-service" / "src"
 ENGINE = DQ / "dq_engine.py"
 QUARANTINE = DQ / "quarantine.py"
@@ -151,6 +160,9 @@ def command_line(step: str, args: argparse.Namespace) -> list[str]:
         return [str(METRICS), "--run", "all" if args.run == "latest" else args.run,
                 "--rules", str(args.rules)]
 
+    if step in ("metadata", "gold"):
+        return [str(METADATA if step == "metadata" else GOLD), "--rules", str(args.rules)]
+
     if step == "import-files":
         return [str(IMPORT_FILES), "--rules", str(args.rules),
                 "--data", str(args.data.resolve()),
@@ -166,19 +178,22 @@ def run(line: list[str]) -> int:
 
 
 def run_pipeline(args: argparse.Namespace) -> int:
-    """ingest -> profile -> validate -> merge -> metrics on the new ingestion."""
+    """ingest -> profile -> validate -> merge -> metrics -> metadata -> gold."""
 
-    result = subprocess.run(
+    # Shown as it comes; the last line is the new ingestion id.
+    line = ""
+    print("$ python " + " ".join(command_line("ingest", args)), flush=True)
+    with subprocess.Popen(
         [sys.executable, *command_line("ingest", args)],
-        cwd=ROOT, capture_output=True, text=True,
-    )
-    print(result.stdout, end="")
-    if result.returncode:
-        print(result.stderr, end="", file=sys.stderr)
-        return result.returncode
+        cwd=ROOT, stdout=subprocess.PIPE, text=True,
+    ) as process:
+        for line in process.stdout:
+            print(line, end="", flush=True)
+    if process.returncode:
+        return process.returncode
 
-    args.run = result.stdout.strip().splitlines()[-1]
-    for step in ("profile", "validate", "merge", "metrics"):
+    args.run = line.strip()
+    for step in ("profile", "validate", "merge", "metrics", "metadata", "gold"):
         code = run(command_line(step, args))
         if code:
             return code
@@ -207,7 +222,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
     for name, help_text in (
         ("ingest", "Load a source file into bronze."),
-        ("pipeline", "Ingest, profile, validate, merge and metrics."),
+        ("pipeline", "Ingest, profile, validate, merge, metrics, metadata and gold."),
     ):
         add(name, help_text).add_argument(
             "--input", type=Path, default=None,
@@ -236,6 +251,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
     add("merge", "Merge valid and resolved records into silver.<dataset>.")
     add("metrics", "Rebuild the DQ metric tables (default: every run).")
+    add("metadata", "Describe silver in the meta schema.")
+    add("gold", "Build the gold star schema from the metadata.")
     add("import-files", "Load runs kept in data/ by earlier versions "
         "(default: every run).").add_argument(
         "--data", type=Path, default=DEFAULT_DATA,

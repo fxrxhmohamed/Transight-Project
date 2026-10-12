@@ -60,9 +60,8 @@ from typing import Any
 import numpy as np
 import pandas as pd
 
-# The bronze layer client lives with the ingestion service (the Docker
-# image copies it next to this file).
-sys.path.append(str(Path(__file__).resolve().parents[2] / "ingestion-service" / "src"))
+# Shared code: the bronze layer client.
+sys.path.append(str(Path(__file__).resolve().parents[2] / "common" / "src"))
 import bronze  # noqa: E402
 
 

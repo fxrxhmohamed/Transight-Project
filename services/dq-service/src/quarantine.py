@@ -8,9 +8,9 @@ worked through in rounds:
                 current value and why it failed
     import      read the edited template; check every line and store the
                 accepted corrections (dq.correction, dq.correction_log)
-    revalidate  apply the corrections and run ALL rules again, together
-                with the valid records (so uniqueness and one-value-per-
-                customer are judged on the whole dataset)
+    revalidate  apply the corrections and run ALL rules again (Spark),
+                together with the valid records (so uniqueness and one-
+                value-per-customer are judged on the whole dataset)
                     pass             -> RESOLVED (dq.<dataset>_resolved)
                     fail             -> OPEN in the next round
                     fail, too often  -> MANUAL_REVIEW_REQUIRED
@@ -56,19 +56,31 @@ from pathlib import Path
 from typing import IO, Any, Callable
 
 import pandas as pd
+from pyspark.sql import DataFrame
+from pyspark.sql import functions as F
 
 import db
-from dq_engine import DEFAULT_RULES, validate_frame
+from dq_engine import (
+    ACCEPTED,
+    DEFAULT_RULES,
+    FOCUS,
+    QUARANTINED,
+    RID,
+    ROW,
+    validate_frame,
+)
 from layout import (
+    AUDIT,
     CORRECTION_COLUMNS,
     DISCARDED,
+    ERROR_COLUMNS,
+    ERRORS,
     MANUAL_REVIEW,
     OPEN,
     RESOLVED,
     Layout,
     LayoutError,
     current_round,
-    data_columns,
     latest_run,
     load_status,
     now_utc,
@@ -76,6 +88,13 @@ from layout import (
     write_csv,
 )
 from registry import ConfigError, Registry, load_registry
+from values import col
+
+spark_io = db.spark_io
+
+# __row of the corrected records: after every context row, so a corrected
+# record identical to another row is the copy that is dropped.
+TARGET_ROW_OFFSET = 1 << 62
 
 
 NULL_MARKER = "__NULL__"
@@ -318,8 +337,38 @@ def cmd_import(args: argparse.Namespace, registry: Registry) -> int:
 # revalidate
 # ============================================================
 
-def resolved_records(layout: Layout, before_round: int) -> list[pd.DataFrame]:
-    return [frame for n, frame in layout.load_resolved() if n < before_round]
+def _ids(values: set[str]) -> DataFrame:
+    """A one-column DataFrame of record ids, for joins."""
+
+    return F.broadcast(spark_io.local_frame(
+        [(v,) for v in sorted(values)], "record_id string",
+    ))
+
+
+def _apply_fixes(records: DataFrame, fixes: pd.DataFrame, columns: list[str]) -> DataFrame:
+    """The records with their FIX corrections applied (__NULL__ empties)."""
+
+    if not len(fixes):
+        return records
+    fixed_columns = sorted(set(fixes["column"]))
+    keys = {c: f"__fix{i}" for i, c in enumerate(fixed_columns)}
+    lines = spark_io.local_frame(
+        [(r.record_id, keys[r.column], r.new_value) for r in fixes.itertuples(index=False)],
+        "record_id string, key string, new_value string",
+    )
+    wide = lines.groupBy("record_id").pivot("key", list(keys.values())).agg(F.first("new_value"))
+    records = records.join(wide, "record_id", "left")
+    return records.select(
+        "record_id",
+        *[
+            F.when(col(keys[c]).isNull(), col(c))
+            .when(col(keys[c]) == NULL_MARKER, F.lit(None).cast("string"))
+            .otherwise(col(keys[c])).alias(c)
+            if c in keys else col(c)
+            for c in columns
+        ],
+        *[c for c in records.columns if c in ("dq_errors", "dq_warnings")],
+    )
 
 
 def revalidate(
@@ -342,10 +391,6 @@ def revalidate(
     next_round = round_number + 1
     pending = open_ids(status.reset_index(), round_number)
 
-    records = layout.load_quarantine(round_number)
-    records = records[records["record_id"].isin(pending)].set_index("record_id")
-    errors = layout.load_errors(round_number)
-
     corrections = layout.load_corrections(round_number)
     corrections = corrections[corrections["record_id"].isin(pending)]
 
@@ -365,42 +410,53 @@ def revalidate(
     if not targets and not discard:
         return None
 
+    columns = layout.columns()
+    open_records = (
+        f"record_id IN (SELECT record_id FROM dq.quarantine_status "
+        f"WHERE dataset = {db.literal(layout.dataset)} "
+        f"AND run_id = {db.literal(layout.run_id)} "
+        f"AND status = 'OPEN' AND round = {round_number})"
+    )
+    records = layout.spark_records("quarantine", round_number, where=open_records)
+    untouched_records = records.join(_ids(untouched), "record_id")
+
     # ---- Corrected records ----
-    columns = data_columns(records.reset_index())
-    corrected = records.loc[sorted(targets), columns].copy()
-    for row in fixes.itertuples(index=False):
-        if row.record_id in targets:
-            corrected.at[row.record_id, row.column] = (
-                pd.NA if row.new_value == NULL_MARKER else row.new_value
-            )
+    corrected = _apply_fixes(
+        records.join(_ids(targets), "record_id"),
+        fixes[fixes["record_id"].isin(targets)], columns,
+    )
 
     # ---- Context: the rest of the dataset, for cross-row rules ----
-    context_parts = [layout.load_valid()]
-    context_parts += resolved_records(layout, round_number)
-    context_parts.append(records.loc[sorted(untouched)].reset_index())
-    context = pd.concat(
-        [part[["record_id", *columns]] for part in context_parts],
-        ignore_index=True,
+    context = layout.spark_records("valid").select("record_id", *columns)
+    if layout.has_records("resolved"):
+        context = context.unionByName(
+            layout.spark_records("resolved", where=f"round < {round_number}")
+            .select("record_id", *columns)
+        )
+    context = context.unionByName(untouched_records.select("record_id", *columns))
+
+    def framed(part: DataFrame, focus: bool, offset: int) -> DataFrame:
+        return part.select(
+            col("record_id").alias(RID),
+            (F.monotonically_increasing_id() + offset).alias(ROW),
+            F.lit(focus).alias(FOCUS),
+            *[col(c) for c in columns],
+        )
+
+    frame = framed(context, False, 0).unionByName(
+        framed(corrected, True, TARGET_ROW_OFFSET)
     )
 
-    frame = pd.concat(
-        [context, corrected.reset_index()[["record_id", *columns]]],
-        ignore_index=True,
-    )
-    ids = frame.pop("record_id")
-    is_target = pd.Series(False, index=frame.index)
-    is_target.iloc[len(context):] = True
-
-    log(f"Round {round_number}: re-validating {len(targets)} corrected "
-        f"records against {len(context)} others.")
+    log(f"Round {round_number}: re-validating {len(targets)} corrected records "
+        "against the rest of the dataset.")
     # Rule statistics count the corrected records only.
-    result = validate_frame(frame, registry, ids, log=log, focus=is_target)
+    result = validate_frame(frame, registry, log=log)
 
-    target_ids = ids[is_target]
-    passed = set(ids[is_target & result.accepted])
-    failed = set(ids[is_target & result.quarantined])
+    outcomes = result.df.filter(col(FOCUS)).select(RID, ACCEPTED, QUARANTINED).collect()
+    passed = {r[RID] for r in outcomes if r[ACCEPTED]}
+    failed = {r[RID] for r in outcomes if r[QUARANTINED]}
     # A corrected record identical to another row is dropped as a duplicate.
-    duplicates = set(target_ids) - passed - failed
+    duplicates = targets - passed - failed
 
     # ---- Ledger ----
     timestamp = now_utc()
@@ -425,23 +481,13 @@ def revalidate(
             status.loc[index, "round"] = new_round
             status.loc[index, "updated_at"] = timestamp
 
-    # ---- Outputs ----
-    resolved = result.valid[result.valid["record_id"].isin(passed)]
-
-    failed_rows = result.quarantine[result.quarantine["record_id"].isin(failed)]
-    carried = records.loc[sorted(untouched)].reset_index()
-    next_records = pd.concat(
-        [failed_rows, carried[failed_rows.columns]], ignore_index=True,
-    )
-    next_errors = pd.concat(
-        [
-            result.errors[result.errors["record_id"].isin(failed)],
-            errors[errors["record_id"].isin(untouched)],
-        ],
-        ignore_index=True,
-    )
-
-    target_errors = result.errors[result.errors["record_id"].isin(failed)]
+    failures_by_rule = [
+        {"rule_id": r["rule_id"], "error_code": r["error_code"],
+         "severity": r["severity"], "count": r["count"]}
+        for r in result.errors(quarantined_only=True, focus=True)
+        .groupBy("rule_id", "error_code", "severity").count()
+        .orderBy("rule_id").collect()
+    ]
     summary = {
         "run_id": layout.run_id,
         "dataset": layout.dataset,
@@ -463,10 +509,7 @@ def revalidate(
             "carried_over_untouched": len(untouched),
             "open_after": len(still_open),
         },
-        "failures_by_rule": (
-            target_errors.groupby(["rule_id", "error_code", "severity"]).size()
-            .rename("count").reset_index().to_dict("records")
-        ),
+        "failures_by_rule": failures_by_rule,
         "status_totals": status["status"].value_counts().to_dict(),
         "rules": result.rule_stats,
         "outputs": {
@@ -476,13 +519,35 @@ def revalidate(
         },
     }
 
-    # One transaction: the round is stored completely or not at all.
+    # ---- Outputs: records first, the ledger and round result last ----
+    stamp = {"dataset": layout.dataset, "run_id": layout.run_id, "round": next_round}
+
+    def stamped(df: DataFrame, constants: dict[str, Any]) -> DataFrame:
+        return df.select(*[F.lit(v).alias(k) for k, v in constants.items()], "*")
+
+    resolved_table = layout.prepare_records("resolved", round_number)
+    next_table = layout.prepare_records("quarantine", next_round)
+    layout.clear(ERRORS, next_round)
+    layout.clear(AUDIT, next_round)
+
+    spark_io.write(
+        stamped(result.valid(focus=True), {"run_id": layout.run_id, "round": round_number}),
+        resolved_table,
+    )
+    next_records = result.quarantine(focus=True).unionByName(
+        untouched_records.select("record_id", *columns, "dq_errors", "dq_warnings")
+    )
+    spark_io.write(stamped(next_records, {"run_id": layout.run_id, "round": next_round}),
+                   next_table)
+    next_errors = result.errors(quarantined_only=True, focus=True).unionByName(
+        layout.spark_table("dq.quarantine_error", ERROR_COLUMNS, round_number)
+        .join(_ids(untouched), "record_id")
+    )
+    spark_io.write(stamped(next_errors, stamp), "dq.quarantine_error")
+    spark_io.write(stamped(result.audit(focus=True), stamp), "dq.remediation_audit")
+    result.release()
+
     with db.transaction():
-        layout.save_resolved(round_number, resolved)
-        layout.save_quarantine(next_round, next_records, next_errors)
-        layout.save_audit(
-            next_round, result.audit[result.audit["record_id"].isin(target_ids)],
-        )
         save_status(layout, status.reset_index())
         layout.save_result(next_round, summary)
 
@@ -600,3 +665,5 @@ if __name__ == "__main__":
     except (ConfigError, LayoutError) as error:
         print(f"Error: {error}", file=sys.stderr)
         sys.exit(2)
+    finally:
+        spark_io.stop()

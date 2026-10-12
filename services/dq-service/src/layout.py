@@ -15,13 +15,18 @@ A run is one ingestion (its ingestion id) or an ad hoc file (a timestamp).
     dq.<dataset>_resolved     records that passed re-validation, per round
     dq.remediation_audit      every automatic repair, per round
     dq.round_result           summary of every round
-    silver.<dataset>          clean data: valid records plus resolved ones,
-                              one row per record
+    silver.<dataset>          clean data, typed: valid records plus
+                              resolved ones, one row per record
     dq.merge_result           counts and checks of the latest merge
 
-Record values are stored as text, exactly as the engine writes them.
-Round 1 is the first validation; re-validating the corrections of round n
-produces round n + 1.
+Record values are stored as text, exactly as the engine writes them
+(silver.<dataset> has typed columns, see merge.py). Round 1 is the first
+validation; re-validating the corrections of round n produces round n + 1.
+
+Spark writes the record tables, errors, audit and round-1 ledger over
+JDBC; the small bookkeeping tables are written here in transactions. A
+round counts once its result is in dq.round_result (written last), so an
+interrupted step leaves nothing that counts and can simply run again.
 """
 
 from __future__ import annotations
@@ -107,9 +112,12 @@ class Layout:
     # ---- The run ----
 
     def exists(self) -> bool:
+        """The run is validated (its round 1 result is stored)."""
+
         with db.transaction() as conn:
             return conn.execute(
-                "SELECT 1 FROM dq.run WHERE dataset = %s AND run_id = %s",
+                "SELECT 1 FROM dq.round_result "
+                "WHERE dataset = %s AND run_id = %s AND round = 1",
                 (self.dataset, self.run_id),
             ).fetchone() is not None
 
@@ -155,6 +163,73 @@ class Layout:
                               {"run_id": self.run_id})
             # The other dq tables follow through ON DELETE CASCADE.
             db.delete(conn, RUN, self.key)
+
+    # ---- Tables Spark writes and reads ----
+
+    def prepare_records(self, kind: str, round_number: int | None = None) -> str:
+        """Create the record table (or add the columns it lacks), remove
+        the run's rows (of one round) and return its name for Spark."""
+
+        where: dict[str, object] = {"run_id": self.run_id}
+        if round_number is not None:
+            where["round"] = round_number
+        with db.transaction() as conn:
+            table = db.ensure_record_table(
+                conn, self.dataset, kind, [*self.columns(), *RECORD_EXTRA[kind]],
+            )
+            db.delete(conn, table, where)
+        return db.qualified(*db.record_table_name(self.dataset, kind))
+
+    def has_records(self, kind: str) -> bool:
+        """The dataset's record table of this kind exists."""
+
+        with db.transaction() as conn:
+            return bool(db.table_columns(conn, *db.record_table_name(self.dataset, kind)))
+
+    def clear(self, table: sql.Identifier, round_number: int) -> None:
+        """Remove the run's rows of one round from a dq table."""
+
+        with db.transaction() as conn:
+            db.delete(conn, table, {**self.key, "round": round_number})
+
+    def spark_records(
+        self,
+        kind: str,
+        round_number: int | None = None,
+        where: str | None = None,
+        with_round: bool = False,
+    ):
+        """A record table of the run as a Spark DataFrame: record_id, the
+        data columns and the kind's extra columns."""
+
+        wanted = ["record_id", *self.columns(), *RECORD_EXTRA[kind]]
+        if with_round:
+            wanted = ["round", *wanted]
+        conditions = [f"run_id = {db.literal(self.run_id)}"]
+        if round_number is not None:
+            conditions.append(f"round = {int(round_number)}")
+        if where:
+            conditions.append(where)
+        query = (
+            f"SELECT {', '.join(db.quote(c) for c in wanted)} "
+            f"FROM {db.qualified(*db.record_table_name(self.dataset, kind))} "
+            f"WHERE {' AND '.join(conditions)}"
+        )
+        return db.spark_io.read(query, predicates=db.spark_io.hash_predicates("record_id"))
+
+    def spark_table(self, table: str, columns: list[str], round_number: int | None = None,
+                    where: str | None = None):
+        """Rows of the run in a dq table (e.g. dq.quarantine_error)."""
+
+        conditions = [f"dataset = {db.literal(self.dataset)}",
+                      f"run_id = {db.literal(self.run_id)}"]
+        if round_number is not None:
+            conditions.append(f"round = {int(round_number)}")
+        if where:
+            conditions.append(where)
+        query = (f"SELECT {', '.join(db.quote(c) for c in columns)} FROM {table} "
+                 f"WHERE {' AND '.join(conditions)}")
+        return db.spark_io.read(query, predicates=db.spark_io.hash_predicates("record_id"))
 
     # ---- Record tables ----
 
@@ -350,11 +425,28 @@ class Layout:
 
     # ---- Clean data ----
 
-    def save_final(self, frame: pd.DataFrame, summary: dict[str, Any]) -> None:
-        """Replace the run's rows in silver.<dataset> and its merge result."""
+    def prepare_silver(self, types: dict[str, str]) -> str:
+        """Create silver.<dataset> with typed columns (or add the columns it
+        lacks), remove the run's rows and return its name for Spark."""
 
+        schema, name = db.record_table_name(self.dataset, "silver")
+        table = sql.Identifier(schema, name)
         with db.transaction() as conn:
-            self._save_records("silver", frame)
+            existing = db.table_columns(conn, schema, name)
+            if not existing:
+                conn.execute(sql.SQL(
+                    "CREATE TABLE {} (run_id text NOT NULL, record_id text NOT NULL, "
+                    "PRIMARY KEY (run_id, record_id))"
+                ).format(table))
+            for column, kind in {**types, "dq_warnings": "text"}.items():
+                if column not in existing:
+                    conn.execute(sql.SQL("ALTER TABLE {} ADD COLUMN IF NOT EXISTS {} {}")
+                                 .format(table, sql.Identifier(column), sql.SQL(kind)))
+            db.delete(conn, table, {"run_id": self.run_id})
+        return db.qualified(schema, name)
+
+    def save_merge_result(self, summary: dict[str, Any]) -> None:
+        with db.transaction() as conn:
             db.delete(conn, MERGE_RESULT, self.key)
             conn.execute(
                 "INSERT INTO dq.merge_result "
@@ -391,7 +483,8 @@ def list_runs(dataset: str) -> list[str]:
 
     with db.transaction() as conn:
         rows = conn.execute(
-            "SELECT run_id FROM dq.run WHERE dataset = %s ORDER BY run_id",
+            "SELECT run_id FROM dq.round_result WHERE dataset = %s AND round = 1 "
+            "ORDER BY run_id",
             (dataset,),
         ).fetchall()
     return [row[0] for row in rows]
@@ -404,19 +497,6 @@ def latest_run(dataset: str) -> str:
     if not runs:
         raise LayoutError(f"No validated runs for {dataset}")
     return runs[-1]
-
-
-# ============================================================
-# Record ids
-# ============================================================
-
-def record_ids(prefix: str, width: int, count: int) -> pd.Series:
-    """<prefix><row number>, row numbers starting at 1."""
-
-    return pd.Series(
-        [f"{prefix}{n:0{width}d}" for n in range(1, count + 1)],
-        dtype="string",
-    )
 
 
 # ============================================================

@@ -855,7 +855,7 @@ def publish(ctx: Context) -> None:
 
     with st.status("Publishing...", expanded=True) as progress:
         st.write("Adding the fixed records to the clean data...")
-        summary = merge_run(ctx.layout, published_by=ctx.user)
+        summary = merge_run(ctx.layout, ctx.registry, published_by=ctx.user)
         st.write("Updating the quality figures for Power BI...")
         export_metrics(ctx.layout.dataset)
         progress.update(label="Published", state="complete")

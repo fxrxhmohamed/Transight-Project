@@ -4,19 +4,26 @@ Every task runs one step of dq.py (python dq.py <step> ...), so a task
 does in Airflow exactly what the same command does by hand.
 
     dq_ingest_validate    ingest -> profile -> validate -> merge -> metrics
+                          -> metadata -> gold
                           A new source file: land it, check it, publish the
                           valid records. Trigger with {"input": "<csv path>"}.
     dq_apply_corrections  import-corrections -> revalidate -> merge -> metrics
+                          -> metadata -> gold
                           A filled-in correction file for a run. Trigger with
                           {"run": "<ingestion id>", "file": "<csv path>"}.
-    dq_publish            merge -> metrics, every evening
+    dq_publish            merge -> metrics -> metadata -> gold, every evening
                           Puts the records fixed in the correction UI that
-                          day into the clean data (the UI's Publish button).
+                          day into the clean data and the gold star schema.
+
+The data work of every step runs on Spark: the tasks submit their jobs to
+the cluster named by SPARK_MASTER (docker-compose.yml).
 
 Environment of the Airflow workers
     METAFLOW_HOME    project folder holding dq.py and config/
                      (default /opt/metaflow)
-    METAFLOW_PYTHON  Python with the services' requirements (default python)
+    METAFLOW_PYTHON  Python with the services' requirements and PySpark
+                     (default python)
+    SPARK_MASTER     spark://spark-master:7077, or local[*]
     POSTGRES_*       the database every step reads and writes
 """
 
@@ -74,8 +81,10 @@ with DAG(
     validate = task("validate", "validate", f"--run {INGESTED}")
     merge = task("merge", "merge", f"--run {INGESTED}")
     metrics = task("metrics", "metrics")
+    metadata = task("metadata", "metadata")
+    gold = task("gold", "gold")
 
-    ingest >> profile >> validate >> merge >> metrics
+    ingest >> profile >> validate >> merge >> metrics >> metadata >> gold
 
 
 with DAG(
@@ -98,17 +107,22 @@ with DAG(
     revalidated = task("revalidate", "revalidate", run)
     merged = task("merge", "merge", run)
     measured = task("metrics", "metrics")
+    described = task("metadata", "metadata")
+    built = task("gold", "gold")
 
-    imported >> revalidated >> merged >> measured
+    imported >> revalidated >> merged >> measured >> described >> built
 
 
 with DAG(
     dag_id="dq_publish",
-    description="Publish the records fixed in the correction UI: merge and metrics.",
+    description="Publish the records fixed in the correction UI: merge, metrics, gold.",
     start_date=datetime(2026, 1, 1),
     schedule="0 18 * * *",
     catchup=False,
     default_args=DEFAULT_ARGS,
     tags=["data-quality"],
 ):
-    task("merge", "merge", "--run latest") >> task("metrics", "metrics")
+    (
+        task("merge", "merge", "--run latest") >> task("metrics", "metrics")
+        >> task("metadata", "metadata") >> task("gold", "gold")
+    )

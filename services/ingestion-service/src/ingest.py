@@ -1,7 +1,10 @@
 """Ingestion: land a source file in the bronze layer (PostgreSQL).
 
-Each run gets an ingestion id (ING_YYYYMMDD_NNN) and is loaded in one
-transaction (see bronze.py and sql/01_bronze.sql):
+Spark reads the file (in parallel, every value as text, exactly as
+written) into a staging table; one transaction then gives the run an
+ingestion id (ING_YYYYMMDD_NNN) and moves the rows into bronze (see
+bronze.py and sql/01_bronze.sql), so an ingestion is stored completely or
+not at all:
 
     bronze.ingestion    what was ingested, from where, when, the source
                         file's SHA-256, row count, columns and how record
@@ -33,11 +36,18 @@ import argparse
 import csv
 import hashlib
 import sys
+import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-import bronze
+# Shared code: the bronze layer client and the Spark helpers.
+sys.path.append(str(Path(__file__).resolve().parents[2] / "common" / "src"))
+import bronze  # noqa: E402
+import spark_io  # noqa: E402
+from pyspark.sql import Window  # noqa: E402
+from pyspark.sql import functions as F  # noqa: E402
+from pyspark.sql.types import StringType, StructField, StructType  # noqa: E402
 
 
 def _default_project_root() -> Path:
@@ -53,6 +63,9 @@ DEFAULT_INPUT = PROJECT_ROOT / "data" / "raw" / "banking" / "banking_transaction
 DEFAULT_DATASET = "banking_transactions"
 
 HASH_CHUNK = 1 << 20
+# Extra columns read past the header: a row that fills one has more fields
+# than the header and stops the ingestion.
+OVERFLOW_COLUMNS = 3
 
 
 def sha256_of(path: Path) -> str:
@@ -63,15 +76,9 @@ def sha256_of(path: Path) -> str:
     return digest.hexdigest()
 
 
-def read_layout(path: Path, encoding: str, delimiter: str) -> tuple[list[str], int]:
-    """Header and number of data rows (quoted line breaks count once)."""
-
+def read_header(path: Path, encoding: str, delimiter: str) -> list[str]:
     with path.open(encoding=encoding, newline="") as handle:
-        reader = csv.reader(handle, delimiter=delimiter)
-        header = next(reader, [])
-        rows = sum(1 for _ in reader)
-
-    return header, rows
+        return next(csv.reader(handle, delimiter=delimiter), [])
 
 
 def relative_to_root(path: Path) -> str:
@@ -81,6 +88,39 @@ def relative_to_root(path: Path) -> str:
         return path.resolve().relative_to(PROJECT_ROOT).as_posix()
     except ValueError:
         return path.resolve().as_posix()
+
+
+def read_rows(source: Path, columns: list[str], encoding: str, delimiter: str):
+    """Every data row in file order with its row number (1, 2, ...).
+
+    Values are text exactly as written. Empty fields are stored as empty
+    text; so are the missing fields of a row shorter than the header (Spark
+    reads both as null and cannot tell them apart).
+    """
+
+    overflow = [f"__overflow{i}" for i in range(OVERFLOW_COLUMNS)]
+    schema = StructType([StructField(c, StringType()) for c in [*columns, *overflow]])
+    df = (
+        spark_io.session().read.schema(schema)
+        .option("header", True).option("enforceSchema", True)
+        .option("encoding", encoding.replace("-sig", "")).option("sep", delimiter)
+        .option("multiLine", True).option("quote", '"').option("escape", '"')
+        .option("mode", "PERMISSIVE")
+        .csv(str(source))
+    )
+    order = Window.orderBy(F.monotonically_increasing_id())
+    df = df.select(F.row_number().over(order).alias("row_number"), "*")
+
+    long_rows = df.filter(" OR ".join(f"`{c}` IS NOT NULL" for c in overflow))
+    first = long_rows.select("row_number").limit(1).collect()
+    if first:
+        raise ValueError(
+            f"Data row {first[0]['row_number']} has more fields than the header "
+            f"({len(columns)})."
+        )
+    return df.select("row_number", *[
+        F.coalesce(F.col(f"`{c}`"), F.lit("")).alias(c) for c in columns
+    ])
 
 
 def ingest(
@@ -95,14 +135,23 @@ def ingest(
         raise FileNotFoundError(f"Input not found: {source}")
 
     started = datetime.now(timezone.utc)
-    columns, row_count = read_layout(source, encoding, delimiter)
+    columns = read_header(source, encoding, delimiter)
+    bronze.check_columns(columns)
 
+    rows = read_rows(source, columns, encoding, delimiter).cache()
+    row_count = rows.count()
+
+    stage = f"_stage_{uuid.uuid4().hex[:12]}"
     with bronze.connect() as conn:
-        return bronze.store(
-            conn, source, relative_to_root(source), dataset,
-            sha256_of(source), columns, row_count, encoding, delimiter,
-            started,
-        )
+        try:
+            spark_io.write(rows, bronze.create_stage(conn, stage, columns))
+            return bronze.store_staged(
+                conn, stage, source, relative_to_root(source), dataset,
+                sha256_of(source), columns, row_count, encoding, delimiter, started,
+            )
+        finally:
+            bronze.drop_stage(conn, stage)
+            rows.unpersist()
 
 
 def parse_args() -> argparse.Namespace:
@@ -121,9 +170,12 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> int:
     args = parse_args()
-    manifest = ingest(
-        args.input.resolve(), args.dataset, args.encoding, args.delimiter,
-    )
+    try:
+        manifest = ingest(
+            args.input.resolve(), args.dataset, args.encoding, args.delimiter,
+        )
+    finally:
+        spark_io.stop()
 
     print(f"Ingested {manifest['source_path']}")
     print(f"  ingestion id  {manifest['ingestion_id']}")

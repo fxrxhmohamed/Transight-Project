@@ -26,13 +26,13 @@ import pandas as pd
 import psycopg
 from psycopg import sql
 
-# The bronze layer client lives with the ingestion service (the Docker
-# image copies it next to this file).
-sys.path.append(str(Path(__file__).resolve().parents[2] / "ingestion-service" / "src"))
+# Shared code: the bronze layer client and the Spark session / JDBC helpers.
+sys.path.append(str(Path(__file__).resolve().parents[2] / "common" / "src"))
 import bronze  # noqa: E402
+import schemas  # noqa: E402
+import spark_io  # noqa: E402
 
 
-SCHEMA_FILE = "02_dq.sql"
 CHUNK_ROWS = 100_000
 
 # Read back in the form layout.now_utc() writes.
@@ -57,7 +57,6 @@ class LayoutError(ValueError):
 
 
 _active: ContextVar[psycopg.Connection | None] = ContextVar("dq_connection", default=None)
-_schema_ready = False
 
 
 @contextmanager
@@ -77,31 +76,33 @@ def transaction() -> Iterator[psycopg.Connection]:
             _active.reset(token)
 
 
-def _schema_file() -> Path | None:
-    here = Path(__file__).resolve()
-    candidates = [here.parent / SCHEMA_FILE]
-    if len(here.parents) > 3:
-        candidates.append(here.parents[3] / "sql" / SCHEMA_FILE)
-    return next((path for path in candidates if path.is_file()), None)
-
-
 def ensure_schema(conn: psycopg.Connection) -> None:
-    """Apply sql/02_dq.sql when the dq tables are missing (database volumes
-    created before them; Docker only runs sql/ on an empty volume)."""
+    """Create the dq, silver and metrics tables when they are missing
+    (database volumes created before them)."""
 
-    global _schema_ready
-    if _schema_ready:
-        return
-    if conn.execute("SELECT to_regclass('dq.run')").fetchone()[0] is None:
-        path = _schema_file()
-        if path is None:
-            raise LayoutError(
-                "The dq tables are missing and sql/02_dq.sql was not found; "
-                "run psql -f sql/02_dq.sql on the database."
-            )
-        conn.execute(path.read_text(encoding="utf-8"))
-        conn.commit()
-    _schema_ready = True
+    schemas.ensure(conn, "02_dq.sql")
+
+
+# ============================================================
+# SQL text for queries Spark runs over JDBC
+# ============================================================
+
+def quote(name: str) -> str:
+    """A quoted SQL identifier."""
+
+    return '"' + name.replace('"', '""') + '"'
+
+
+def literal(value: object) -> str:
+    """A quoted SQL string literal (or a number)."""
+
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return str(value)
+    return "'" + str(value).replace("'", "''") + "'"
+
+
+def qualified(schema: str, name: str) -> str:
+    return f"{quote(schema)}.{quote(name)}"
 
 
 # ============================================================

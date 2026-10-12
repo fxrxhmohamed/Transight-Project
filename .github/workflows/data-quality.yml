@@ -8,7 +8,7 @@ jobs:
   test:
     runs-on: ubuntu-latest
 
-    # Bronze layer database; the tests create and drop their own database
+    # The pipeline's database; the tests create and drop their own database
     # in it.
     services:
       postgres:
@@ -29,20 +29,29 @@ jobs:
       POSTGRES_DB: metaflow
       POSTGRES_USER: metaflow
       POSTGRES_PASSWORD: ci_only
+      # Spark in local mode; the JDBC driver is fetched from Maven.
+      SPARK_DRIVER_MEMORY: 4g
 
     steps:
       - uses: actions/checkout@v4
 
+      # Spark needs Java 17.
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
       - uses: actions/setup-python@v5
         with:
-          python-version: "3.13"
+          python-version: "3.12"
           cache: pip
           cache-dependency-path: services/*/requirements.txt
 
       - name: Install
         run: |
-          python -m pip install -r services/dq-service/requirements.txt \
+          python -m pip install -r services/ingestion-service/requirements.txt \
                                 -r services/metadata-service/requirements.txt \
+                                -r services/dq-service/requirements.txt \
                                 pytest
 
       # 50-row test dataset with one example of each defect, run through

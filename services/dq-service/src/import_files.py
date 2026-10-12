@@ -14,8 +14,10 @@ Earlier versions wrote every output of a run to files under data/:
 
 This stores each such run in the dq tables (layout.py) as if it had been
 run against the database, keeping its rounds, ledger history and
-correction log. Runs already in the database are left alone. The files
-are not changed; delete data/ yourself once the import is checked.
+correction log. Its clean data is rebuilt, typed, by running the merge
+afterwards (python dq.py merge --run <id>). Runs already in the database
+are left alone. The files are not changed; delete data/ yourself once the
+import is checked.
 
 Usage
 -----
@@ -122,11 +124,6 @@ def import_run(data: Path, dataset: str, run_id: str) -> str:
         db.write_frame(conn, STATUS, status[STATUS_COLUMNS], fixed=layout.key)
         db.write_frame(conn, HISTORY, history[HISTORY_COLUMNS], fixed=layout.key)
 
-        final_file = area("final") / "clean.csv"
-        merge_file = area("final") / "merge_result.json"
-        if final_file.is_file() and merge_file.is_file():
-            layout.save_final(read_text_csv(final_file), read_json(merge_file))
-
     return (f"imported: {len(valid)} valid, {len(status)} quarantined, "
             f"{len(results)} rounds")
 
@@ -161,7 +158,7 @@ def main() -> int:
 
     for run_id in runs:
         print(f"{run_id}: {import_run(args.data, dataset, run_id)}", flush=True)
-    print("Run 'python dq.py metrics' to rebuild the metric tables.")
+    print("Then for each run: python dq.py merge --run <id>; and once: python dq.py metrics")
     return 0
 
 

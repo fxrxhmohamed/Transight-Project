@@ -5,12 +5,12 @@ each defect, listed in tests/data/expected_defects.csv with the rule that
 must catch it and the outcome. Every step runs through dq.py, as Airflow
 runs it.
 
-Every step stores its results in PostgreSQL (docker compose up -d
-postgres, or the POSTGRES_* variables of .env). The tests create a
-temporary database with sql/*.sql and drop it at the end; the user needs
-CREATEDB.
+The steps run on Spark (Java needed) and store their results in
+PostgreSQL. The tests create a temporary database with sql/*.sql and drop
+it at the end; the user needs CREATEDB. Run them in the pipeline
+container:
 
-    python -m pytest tests
+    docker compose run --rm pipeline python -m pytest tests
 """
 
 from __future__ import annotations
@@ -322,6 +322,57 @@ def test_correction_flow(run: Run, first_round: dict, database: str) -> None:
 
 
 # ============================================================
+# Silver types, metadata engine, gold (AutoETL)
+# ============================================================
+
+def query(database: str, sql: str, *params) -> list[tuple]:
+    with connect(database) as conn:
+        return conn.execute(sql, params).fetchall()
+
+
+def test_silver_is_typed(run: Run, database: str) -> None:
+    types = dict(query(
+        database,
+        "SELECT column_name, data_type FROM information_schema.columns "
+        "WHERE table_schema = 'silver' AND table_name = %s", DATASET,
+    ))
+    assert types["credit_score"] == "bigint"
+    assert types["transaction_amount"] == "numeric"
+    assert types["transaction_date"] == "date"
+    assert types["transaction_time"] == "time without time zone"
+    assert types["login_success"] == "boolean"
+    assert types["customer_id"] == "text"
+
+
+def test_metadata_and_gold(run: Run, database: str) -> None:
+    dq("metadata")
+    dq("gold")
+
+    [(grain, records)] = query(
+        database, "SELECT grain_entity, record_count FROM meta.dataset WHERE dataset = %s",
+        DATASET)
+    assert grain == "transaction"
+    entities = dict(query(database, "SELECT entity, distinct_keys FROM meta.entity "
+                                    "WHERE dataset = %s", DATASET))
+    assert set(entities) == {"transaction", "account", "customer", "bank", "branch"}
+    # Personal data: no min or max in the metadata.
+    pii = query(database, "SELECT min_value, max_value FROM meta.column "
+                          "WHERE dataset = %s AND is_pii", DATASET)
+    assert pii and all(lo is None and hi is None for lo, hi in pii)
+
+    [(facts,)] = query(database, "SELECT count(*) FROM gold.fact_transaction")
+    assert facts == records
+    for entity in ("account", "customer", "bank", "branch"):
+        [(rows,)] = query(database, f"SELECT count(*) FROM gold.dim_{entity}")
+        assert rows == entities[entity]
+    [(days, first, last)] = query(
+        database, "SELECT count(*), min(date_key), max(date_key) FROM gold.dim_date")
+    [(lo, hi)] = query(database, "SELECT min(transaction_date), max(transaction_date) "
+                                 "FROM gold.fact_transaction")
+    assert first <= lo and last >= hi and days == (last - first).days + 1
+
+
+# ============================================================
 # Correction UI and Airflow
 # ============================================================
 
@@ -360,7 +411,7 @@ def test_airflow_dags_only_call_known_steps() -> None:
         and len(node.args) > 1 and isinstance(node.args[1], ast.Constant)
     }
     assert {"ingest", "profile", "validate", "import-corrections",
-            "revalidate", "merge", "metrics"} <= steps
+            "revalidate", "merge", "metrics", "metadata", "gold"} <= steps
     for step in steps:
         extra = ["--file", "x.csv"] if step == "import-corrections" else []
         assert parse_args([step, *extra]).step == step

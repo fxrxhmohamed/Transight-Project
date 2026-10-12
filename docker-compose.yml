@@ -1,17 +1,29 @@
-# Local Airflow for the data-quality DAGs (airflow/dags/data_quality.py).
+# Everything the pipeline needs, locally:
 #
-#   docker compose up -d --build      start (first build takes a few minutes)
-#   http://localhost:8080             Airflow UI (no login: local use only)
-#   docker compose down               stop
+#   docker compose up -d --build        postgres, Spark cluster, Airflow, correction UI
+#   docker compose run --rm pipeline python dq.py <step> ...   run one step
+#   docker compose run --rm pipeline python -m pytest tests     run the tests
+#   docker compose down                 stop (data stays in the volumes)
 #
-# The project folder is mounted at /opt/metaflow (code, config, source
-# files). Every step stores its results in the postgres service, which the
-# commands and the correction UI on this machine use too (localhost:5432).
+#   http://localhost:8080   Airflow (no login: local use only)
+#   http://localhost:8501   correction UI (UI_PORT in .env to change)
+#   http://localhost:8081   Spark master UI
+#   localhost:5432          PostgreSQL
+#
+# The project folder is mounted at /opt/metaflow in every container (code,
+# config, source files); every result is stored in the postgres service.
+
+x-database: &database
+  POSTGRES_HOST: postgres
+  POSTGRES_PORT: "5432"
+  POSTGRES_DB: ${POSTGRES_DB:-metaflow}
+  POSTGRES_USER: ${POSTGRES_USER:-metaflow}
+  POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-change_me_local_only}
 
 services:
-  # Bronze, dq, silver and metrics schemas. sql/*.sql runs once, on the
-  # first start of an empty volume (the dq-service creates sql/02_dq.sql's
-  # tables itself on older volumes). From this machine: localhost:5432.
+  # Bronze, dq, silver, gold, meta and metrics schemas. sql/*.sql runs once,
+  # on the first start of an empty volume (the steps create their tables
+  # themselves on older volumes).
   postgres:
     image: postgres:17
     environment:
@@ -29,36 +41,102 @@ services:
       retries: 10
     restart: unless-stopped
 
+  # Spark standalone cluster that Airflow submits the steps to. Executors
+  # read the source files from the mounted project and talk to postgres
+  # over JDBC; they never run Python (the steps use Spark SQL only).
+  spark-master:
+    image: apache/spark:4.1.1
+    command: /opt/spark/bin/spark-class org.apache.spark.deploy.master.Master
+    ports:
+      - "8081:8080"
+    restart: unless-stopped
+
+  spark-worker:
+    image: apache/spark:4.1.1
+    command: /opt/spark/bin/spark-class org.apache.spark.deploy.worker.Worker spark://spark-master:7077
+    environment:
+      SPARK_WORKER_CORES: ${SPARK_WORKER_CORES:-4}
+      SPARK_WORKER_MEMORY: ${SPARK_WORKER_MEMORY:-3g}
+    volumes:
+      - .:/opt/metaflow:ro
+    depends_on:
+      - spark-master
+    restart: unless-stopped
+
+  # Runtime of dq.py and the tests (Spark in local mode inside the
+  # container). Only started by "docker compose run".
+  pipeline:
+    build:
+      context: .
+      dockerfile: docker/pipeline.Dockerfile
+    image: metaflow-pipeline
+    profiles: ["tools"]
+    environment:
+      <<: *database
+      SPARK_DRIVER_MEMORY: ${SPARK_DRIVER_MEMORY:-4g}
+    volumes:
+      - .:/opt/metaflow
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  # Correction UI (Streamlit). Sending changes re-validates them with Spark
+  # in this container.
+  ui:
+    image: metaflow-pipeline
+    command: >
+      python -m streamlit run services/dq-service/src/correction_ui.py
+      --server.address 0.0.0.0 --server.port 8501 --server.headless true
+    ports:
+      - "${UI_PORT:-8501}:8501"
+    environment:
+      <<: *database
+      SPARK_DRIVER_MEMORY: ${SPARK_DRIVER_MEMORY:-4g}
+    volumes:
+      - .:/opt/metaflow
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: unless-stopped
+
   airflow:
     build:
       context: .
       dockerfile: airflow/Dockerfile
+      # The pipeline image's Python packages are copied, not downloaded
+      # again: build the pipeline image first (docker compose build pipeline).
+      additional_contexts:
+        pipeline: docker-image://metaflow-pipeline
     image: metaflow-airflow
     command: standalone
+    hostname: airflow
     ports:
       - "8080:8080"
     environment:
+      <<: *database
       AIRFLOW__CORE__DAGS_FOLDER: /opt/metaflow/airflow/dags
       AIRFLOW__CORE__LOAD_EXAMPLES: "false"
       # Local development: everyone is admin, no login screen.
       AIRFLOW__CORE__SIMPLE_AUTH_MANAGER_ALL_ADMINS: "true"
       METAFLOW_HOME: /opt/metaflow
       METAFLOW_PYTHON: /home/airflow/metaflow-venv/bin/python
-      POSTGRES_HOST: postgres
-      POSTGRES_PORT: "5432"
-      POSTGRES_DB: ${POSTGRES_DB:-metaflow}
-      POSTGRES_USER: ${POSTGRES_USER:-metaflow}
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-change_me_local_only}
+      # The steps' Spark jobs run on the cluster; executors reach the
+      # driver (the task) at this address.
+      SPARK_MASTER: spark://spark-master:7077
+      SPARK_DRIVER_HOST: airflow
+      SPARK_DRIVER_MEMORY: 2g
     depends_on:
       postgres:
         condition: service_healthy
+      spark-master:
+        condition: service_started
     volumes:
       - .:/opt/metaflow
       - airflow-home:/opt/airflow
     restart: unless-stopped
 
 volumes:
-  # All pipeline data: bronze, dq, silver and metrics.
+  # All pipeline data: bronze, dq, silver, gold, meta and metrics.
   postgres-data:
   # Airflow's own database and logs.
   airflow-home:

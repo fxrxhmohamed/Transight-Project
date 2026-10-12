@@ -15,12 +15,13 @@ Connection: METAFLOW_DB_URL (a libpq URL) if set, otherwise POSTGRES_HOST,
 POSTGRES_PORT, POSTGRES_DB, POSTGRES_USER and POSTGRES_PASSWORD, with the
 defaults of docker-compose.yml.
 
-Used by ingestion (write), the profiler and the validation engine (read).
+Used by ingestion (write: Spark fills a staging table, store_staged moves
+it into bronze in one transaction), the profiler and the validation engine
+(read).
 """
 
 from __future__ import annotations
 
-import csv
 import io
 import json
 import os
@@ -147,8 +148,27 @@ def next_ingestion_id(conn: psycopg.Connection, today: str) -> str:
     return f"ING_{today}_{number + 1:03d}"
 
 
-def store(
+def create_stage(conn: psycopg.Connection, name: str, columns: list[str]) -> str:
+    """An unlogged staging table bronze.<name> for Spark to fill: row_number
+    plus one text column per source column. Returns its quoted name."""
+
+    target = sql.Identifier("bronze", name)
+    with conn.transaction():
+        conn.execute(sql.SQL("CREATE UNLOGGED TABLE {} (row_number integer NOT NULL, {})").format(
+            target,
+            sql.SQL(", ").join(sql.SQL("{} text").format(sql.Identifier(c)) for c in columns),
+        ))
+    return f'"bronze"."{name}"'
+
+
+def drop_stage(conn: psycopg.Connection, name: str) -> None:
+    with conn.transaction():
+        conn.execute(sql.SQL("DROP TABLE IF EXISTS {}").format(sql.Identifier("bronze", name)))
+
+
+def store_staged(
     conn: psycopg.Connection,
+    stage: str,
     source: Path,
     source_path: str,
     dataset: str,
@@ -159,11 +179,14 @@ def store(
     delimiter: str,
     started: datetime,
 ) -> dict[str, Any]:
-    """Load every row of the source into bronze.<dataset> in one transaction."""
+    """Move the staged rows into bronze.<dataset> in one transaction: the
+    ingestion gets its id, its catalog row and record ids, or nothing is
+    stored."""
 
     check_columns(columns)
     table = table_name_of(dataset)
     width = max(MIN_ROW_DIGITS, len(str(row_count)))
+    target = sql.Identifier("bronze", table)
 
     with conn.transaction():
         conn.execute("LOCK TABLE bronze.ingestion IN SHARE ROW EXCLUSIVE MODE")
@@ -183,37 +206,22 @@ def store(
              table, prefix, width, started),
         )
         ensure_table(conn, table, columns)
-        target = sql.Identifier("bronze", table)
 
-        with source.open(encoding=encoding, newline="") as handle, \
-                conn.cursor().copy(sql.SQL("COPY {} ({}) FROM STDIN").format(
-                    target,
-                    sql.SQL(", ").join(
-                        map(sql.Identifier, (*RECORD_FIELDS, *columns))),
-                )) as copy:
-            reader = csv.reader(handle, delimiter=delimiter)
-            next(reader, None)
-            for number, row in enumerate(reader, start=1):
-                if len(row) > len(columns):
-                    raise ValueError(
-                        f"Data row {number} has {len(row)} fields; the header "
-                        f"has {len(columns)}."
-                    )
-                # Short rows: the missing trailing fields are NULL.
-                row += [None] * (len(columns) - len(row))
-                copy.write_row((
-                    ingestion_id, number, f"{prefix}{number:0{width}d}", *row,
-                ))
+        names = sql.SQL(", ").join(map(sql.Identifier, columns))
+        conn.execute(sql.SQL(
+            "INSERT INTO {} (ingestion_id, row_number, record_id, {}) "
+            "SELECT %s, row_number, %s || lpad(row_number::text, %s, '0'), {} "
+            "FROM {} ORDER BY row_number"
+        ).format(target, names, names, sql.Identifier("bronze", stage)),
+            (ingestion_id, prefix, width))
 
         stored = conn.execute(
-            sql.SQL("SELECT count(*) FROM {} WHERE ingestion_id = %s")
-            .format(target),
+            sql.SQL("SELECT count(*) FROM {} WHERE ingestion_id = %s").format(target),
             (ingestion_id,),
         ).fetchone()[0]
         if stored != row_count:
             raise BronzeError(
-                f"Stored {stored} rows for {ingestion_id}; the source has "
-                f"{row_count}."
+                f"Stored {stored} rows for {ingestion_id}; the source has {row_count}."
             )
 
     return find_ingestion(conn, dataset, ingestion_id)

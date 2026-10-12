@@ -1,244 +1,262 @@
-"""Rule detection: which rows break a rule.
+"""Rule detection: which rows break a rule (Spark SQL expressions).
 
-Every check returns a boolean mask over the batch (True = the row fails)
-and only ever flags rows inside the given scope (active rows that match
-the rule's "when" condition).
+Every check is a boolean SQL expression (true = the row fails) and only
+ever flags rows inside the given scope (active rows that match the rule's
+"when" condition). Column values are read through a resolver, get(name)
+-> SQL, so a check can be evaluated on repaired values before they are
+stored.
 """
 
 from __future__ import annotations
 
-import operator
-from typing import TYPE_CHECKING, Any
+import re
+from typing import TYPE_CHECKING, Any, Callable
 
-import pandas as pd
-
-from values import as_flags, format_number, resolve_bound
+from values import (
+    NULL,
+    all_of,
+    any_of,
+    case,
+    flag,
+    format_number,
+    format_temporal,
+    full_match,
+    ident,
+    is_in,
+    lit,
+    parse_values,
+    resolve_bound,
+    strip,
+)
 
 if TYPE_CHECKING:
-    from dq_engine import Batch
-    from registry import Rule
+    from registry import Registry, Rule
 
+Getter = Callable[[str], str]
 
-OPERATORS = {
-    ">=": operator.ge,
-    ">": operator.gt,
-    "<=": operator.le,
-    "<": operator.lt,
-    "==": operator.eq,
-    "!=": operator.ne,
-}
+OPERATORS = {">=": ">=", ">": ">", "<=": "<=", "<": "<", "==": "=", "!=": "!="}
 
 
 # ============================================================
 # Conditions ("when")
 # ============================================================
 
-def condition_mask(batch: Batch, condition: dict[str, Any] | None) -> pd.Series:
+def condition(get: Getter, spec: dict[str, Any] | None) -> str:
     """Rows matching a rule's applicability condition."""
 
-    index = batch.data.index
+    if not spec:
+        return "true"
 
-    if not condition:
-        return pd.Series(True, index=index)
+    if "all" in spec:
+        return all_of(*[condition(get, part) for part in spec["all"]])
 
-    if "all" in condition:
-        mask = pd.Series(True, index=index)
-        for part in condition["all"]:
-            mask &= condition_mask(batch, part)
-        return mask
+    if "any" in spec:
+        return any_of(*[condition(get, part) for part in spec["any"]])
 
-    if "any" in condition:
-        mask = pd.Series(False, index=index)
-        for part in condition["any"]:
-            mask |= condition_mask(batch, part)
-        return mask
+    if "not" in spec:
+        return f"(NOT {condition(get, spec['not'])})"
 
-    if "not" in condition:
-        return ~condition_mask(batch, condition["not"])
+    values = get(spec["column"])
 
-    values = batch.data[condition["column"]]
+    if "in" in spec:
+        return flag(is_in(values, spec["in"]))
+    if "not_in" in spec:
+        return all_of(f"{values} IS NOT NULL", f"NOT {flag(is_in(values, spec['not_in']))}")
+    if "equals" in spec:
+        return flag(f"{values} = {lit(str(spec['equals']))}")
+    if "is_null" in spec:
+        return f"({values} IS {'' if spec['is_null'] else 'NOT '}NULL)"
+    if "not_null" in spec:
+        return f"({values} IS {'NOT ' if spec['not_null'] else ''}NULL)"
 
-    if "in" in condition:
-        return as_flags(values.isin([str(v) for v in condition["in"]]))
-    if "not_in" in condition:
-        return values.notna() & ~as_flags(
-            values.isin([str(v) for v in condition["not_in"]])
-        )
-    if "equals" in condition:
-        return as_flags(values.eq(str(condition["equals"])))
-    if "is_null" in condition:
-        return values.isna() if condition["is_null"] else values.notna()
-    if "not_null" in condition:
-        return values.notna() if condition["not_null"] else values.isna()
+    raise ValueError(f"Unsupported condition: {spec}")
 
-    raise ValueError(f"Unsupported condition: {condition}")
+
+def condition_columns(spec: dict[str, Any] | None) -> set[str]:
+    if not spec:
+        return set()
+    columns: set[str] = set()
+    for key in ("all", "any"):
+        for part in spec.get(key, []):
+            columns |= condition_columns(part)
+    if "not" in spec:
+        columns |= condition_columns(spec["not"])
+    if "column" in spec:
+        columns.add(spec["column"])
+    return columns
 
 
 # ============================================================
 # Row-level checks
 # ============================================================
 
-def _range_failures(
-    typed: pd.Series,
-    params: dict[str, Any],
-    column_type: str,
-) -> pd.Series:
+def typed(registry: Registry, get: Getter, column: str) -> str:
+    return parse_values(get(column), registry.columns.get(column, {"type": "string"}))
+
+
+def _range_failures(values: str, params: dict[str, Any], column_type: str) -> str:
     low = resolve_bound(params.get("min"), column_type)
     high = resolve_bound(params.get("max"), column_type)
-    out = pd.Series(False, index=typed.index)
+    out = []
 
     if low is not None:
-        out |= (
-            typed.le(low) if params.get("exclusive_min") else typed.lt(low)
-        )
+        out.append(f"{values} {'<=' if params.get('exclusive_min') else '<'} {lit(low)}")
     if high is not None:
-        out |= (
-            typed.ge(high) if params.get("exclusive_max") else typed.gt(high)
-        )
+        out.append(f"{values} {'>=' if params.get('exclusive_max') else '>'} {lit(high)}")
 
-    return as_flags(out) & typed.notna()
+    return all_of(flag(any_of(*out)), f"{values} IS NOT NULL")
 
 
-def _offset(params: dict[str, Any]) -> pd.DateOffset | None:
-    offset = params.get("offset")
+def _with_offset(values: str, offset: dict[str, Any] | None) -> str:
+    """date + {years, months, days} (calendar arithmetic, as DateOffset)."""
+
     if not offset:
-        return None
-    return pd.DateOffset(**{k: int(v) for k, v in offset.items()})
+        return values
+    months = int(offset.get("years", 0)) * 12 + int(offset.get("months", 0))
+    if months:
+        values = f"add_months({values}, {months})"
+    if offset.get("days"):
+        values = f"date_add({values}, {int(offset['days'])})"
+    return values
 
 
-def detect(batch: Batch, rule: Rule, scope: pd.Series) -> pd.Series:
+def expression_sql(registry: Registry, rule: Rule, get: Getter) -> str:
+    """The rule's expression with every column replaced by its typed value."""
+
+    text = rule.params["expression"]
+    typed_columns = {c: typed(registry, get, c) for c in rule.columns}
+    pattern = "|".join(re.escape(c) for c in sorted(typed_columns, key=len, reverse=True))
+    return re.sub(
+        rf"(?<![\w`])(?:{pattern})(?![\w`])",
+        lambda m: f"({typed_columns[m.group(0)]})", text,
+    )
+
+
+def detect(registry: Registry, rule: Rule, get: Getter, scope: str) -> str:
     """Rows in scope that break a single-column or cross-column rule."""
 
     kind = rule.type
     column = rule.column
-    values = batch.data[column] if column else None
+    values = get(column) if column else None
 
     if kind == "not_null":
-        failing = values.isna()
+        failing = f"({values} IS NULL)"
 
     elif kind == "is_null":
-        failing = values.notna()
+        failing = f"({values} IS NOT NULL)"
 
     elif kind == "type":
-        failing = values.notna() & batch.typed(column).isna()
+        failing = all_of(f"{values} IS NOT NULL", f"{typed(registry, get, column)} IS NULL")
 
     elif kind == "pattern":
-        matches = as_flags(values.str.fullmatch(rule.params["pattern"]))
-        failing = values.notna() & ~matches
+        failing = all_of(f"{values} IS NOT NULL",
+                         f"NOT {flag(full_match(values, rule.params['pattern']))}")
 
     elif kind in ("allowed_values", "reference"):
         # reference: values loaded from the lookup file at config load.
-        allowed = [str(v) for v in rule.params["values"]]
-        failing = values.notna() & ~as_flags(values.isin(allowed))
+        failing = all_of(f"{values} IS NOT NULL",
+                         f"NOT {flag(is_in(values, rule.params['values']))}")
 
     elif kind == "expression":
-        # e.g. 'abs(amount_egp - transaction_amount) <= 0.01'; rows with a
-        # missing input are not judged.
-        frame = pd.DataFrame({c: batch.typed(c) for c in rule.columns})
-        holds = frame.eval(rule.params["expression"], engine="python")
-        failing = frame.notna().all(axis=1) & ~as_flags(
-            pd.Series(holds, index=frame.index).astype("boolean")
-        )
+        # e.g. 'abs(amount_egp - transaction_amount) <= 0.01' over typed
+        # values; rows with a missing input are not judged.
+        present = all_of(*[f"{typed(registry, get, c)} IS NOT NULL" for c in rule.columns])
+        holds = f"CAST(({expression_sql(registry, rule, get)}) AS BOOLEAN)"
+        failing = all_of(present, f"NOT {flag(holds)}")
 
     elif kind == "range":
         failing = _range_failures(
-            batch.typed(column),
-            rule.params,
-            batch.spec(column).get("type", "decimal"),
+            typed(registry, get, column), rule.params,
+            registry.columns.get(column, {}).get("type", "decimal"),
         )
 
     elif kind == "unique":
-        present = scope & values.notna()
-        failing = pd.Series(False, index=values.index)
-        failing[present] = values[present].duplicated(keep=False)
+        present = all_of(scope, f"{values} IS NOT NULL")
+        count = f"sum(CASE WHEN {present} THEN 1 END) OVER (PARTITION BY {values})"
+        failing = all_of(present, f"{count} > 1")
 
     elif kind == "compare":
-        left = batch.typed(rule.params["left"])
-        right = batch.typed(rule.params["right"])
-        offset = _offset(rule.params)
-        if offset is not None:
-            right = right + offset
-        holds = OPERATORS[rule.params["operator"]](left, right)
-        failing = left.notna() & right.notna() & ~as_flags(holds)
+        left = typed(registry, get, rule.params["left"])
+        right = _with_offset(typed(registry, get, rule.params["right"]),
+                             rule.params.get("offset"))
+        holds = f"{left} {OPERATORS[rule.params['operator']]} {right}"
+        failing = all_of(f"{left} IS NOT NULL", f"{right} IS NOT NULL", f"NOT {flag(holds)}")
 
     elif kind == "derived":
-        expected = derived_values(batch, rule)
-        actual = batch.typed(column).dt.strftime(rule.params["format"])
-        failing = expected.notna() & (
-            actual.isna() | as_flags(actual.ne(expected))
-        )
+        expected = derived_values(registry, rule, get)
+        actual = format_temporal(typed(registry, get, column), rule.params["format"])
+        failing = all_of(f"{expected} IS NOT NULL",
+                         any_of(f"{actual} IS NULL", flag(f"{actual} != {expected}")))
 
     else:
         raise ValueError(f"detect() does not handle {kind}")
 
-    return scope & as_flags(failing)
+    return all_of(scope, flag(failing))
 
 
-def derived_values(batch: Batch, rule: Rule) -> pd.Series:
+def derived_values(registry: Registry, rule: Rule, get: Getter) -> str:
     """Expected value of a derived column, from its source column."""
 
-    source = batch.typed(rule.params["source"])
-    return source.dt.strftime(rule.params["format"]).astype("string")
+    return format_temporal(typed(registry, get, rule.params["source"]), rule.params["format"])
 
 
-def generated_values(batch: Batch, rule: Rule) -> pd.Series:
+def generated_values(registry: Registry, rule: Rule, get: Getter) -> str:
     """Values of a generated column, computed from cleaned columns.
 
     convert_currency  amount x rate of its currency, e.g. 1000 USD at
                       52.40 -> '52400'
     case              value of the first case whose condition matches,
-                      else the default (NA without one)
+                      else the default (null without one)
 
-    NA where the value cannot be computed (unknown currency, no match).
+    Null where the value cannot be computed (unknown currency, no match).
     """
 
     method = rule.params["method"]
 
     if method == "convert_currency":
-        amount = batch.typed(rule.params["amount"])
-        rates = {
-            str(code): float(rate)
-            for code, rate in rule.params["rates"].items()
-        }
-        rate = batch.data[rule.params["currency"]].map(rates)
-        converted = (
-            amount * pd.to_numeric(rate.astype(object), errors="coerce")
-        ).round(int(rule.params.get("decimals", 2)))
-        return converted.map(format_number, na_action="ignore").astype("string")
+        amount = typed(registry, get, rule.params["amount"])
+        currency = get(rule.params["currency"])
+        rate = case(*[(f"{currency} = {lit(str(code))}", lit(float(value)))
+                      for code, value in rule.params["rates"].items()],
+                    otherwise="CAST(NULL AS DOUBLE)")
+        decimals = int(rule.params.get("decimals", 2))
+        return format_number(f"round({amount} * {rate}, {decimals})")
 
     if method == "case":
-        result = pd.Series(pd.NA, index=batch.data.index, dtype="string")
-        for case in rule.params["cases"]:
-            hit = result.isna() & condition_mask(batch, case.get("when"))
-            result[hit] = str(case["value"])
-        if "default" in rule.params:
-            result = result.fillna(str(rule.params["default"]))
-        return result
+        default = lit(str(rule.params["default"])) if "default" in rule.params else NULL
+        return case(*[(condition(get, c.get("when")), lit(str(c["value"])))
+                      for c in rule.params["cases"]], otherwise=default)
 
     raise ValueError(f"Rule {rule.id}: unknown generate method {method}")
 
 
 # ============================================================
-# Preprocessing checks (one mask per column)
+# Preprocessing checks (one per column)
 # ============================================================
 
-def whitespace_mask(values: pd.Series) -> pd.Series:
-    return values.notna() & as_flags(values.ne(values.str.strip()))
+def whitespace_failures(values: str) -> str:
+    return all_of(f"{values} IS NOT NULL", flag(f"{values} != {strip(values)}"))
 
 
-def null_token_mask(values: pd.Series, tokens: set[str]) -> pd.Series:
-    folded = values.str.strip().str.casefold()
-    return values.notna() & as_flags(folded.isin(tokens))
+def null_token_failures(values: str, tokens: set[str]) -> str:
+    return all_of(f"{values} IS NOT NULL", flag(is_in(f"lower({strip(values)})", sorted(tokens))))
+
+
+def null_tokens(registry: Registry) -> set[str]:
+    """Null placeholders from the schema registry, compared casefolded."""
+
+    tokens = registry.dataset.get("null_tokens", [])
+    return {str(t).strip().casefold() for t in tokens} - {""}
 
 
 # ============================================================
 # Relationships
 # ============================================================
 
-def dependency_columns(batch: Batch, rule: Rule) -> tuple[str, list[str]]:
+def dependency_columns(registry: Registry, rule: Rule) -> tuple[str, list[str]]:
     """Determinant and dependent columns of a functional dependency."""
 
-    schema = batch.registry.schema
+    schema = registry.schema
 
     if "entity" in rule.params:
         entity = schema["entities"][rule.params["entity"]]
@@ -250,58 +268,6 @@ def dependency_columns(batch: Batch, rule: Rule) -> tuple[str, list[str]]:
     return dependency["determinant"], list(dependency["dependents"])
 
 
-def functional_dependency(
-    batch: Batch,
-    rule: Rule,
-    scope: pd.Series,
-) -> tuple[pd.Series, dict[str, int]]:
-    """Rows whose dependent value differs from the key's majority value.
-
-    E.g. a customer_id that shows 'Male' on 20 rows and 'Female' on one:
-    the one row fails. Returns the failing rows and counts per column.
-    """
-
-    determinant, dependents = dependency_columns(batch, rule)
-    keys = batch.data[determinant]
-    base = scope & keys.notna()
-
-    failing = pd.Series(False, index=keys.index)
-    per_column: dict[str, int] = {}
-
-    key_codes = pd.Series(pd.factorize(keys[base])[0], index=keys[base].index)
-
-    for column in dependents:
-        values = batch.data.loc[base, column]
-        present = values.notna()
-
-        if not present.any():
-            continue
-
-        value_codes = pd.factorize(values[present])[0]
-        pairs = pd.DataFrame({
-            "key": key_codes[present].to_numpy(),
-            "value": value_codes,
-        })
-
-        # value_counts sorts by frequency, so the first row per key is
-        # its majority value.
-        majority = (
-            pairs.value_counts()
-            .reset_index()
-            .drop_duplicates("key")
-            .set_index("key")["value"]
-        )
-        expected = majority.reindex(pairs["key"]).to_numpy()
-        bad = value_codes != expected
-
-        per_column[column] = int(bad.sum())
-        failing[values[present].index[bad]] = True
-
-    return failing, per_column
-
-
-def null_tokens(batch: Batch) -> set[str]:
-    """Null placeholders from the schema registry, compared casefolded."""
-
-    tokens = batch.registry.dataset.get("null_tokens", [])
-    return {str(t).strip().casefold() for t in tokens} - {""}
+__all__ = ["Getter", "condition", "condition_columns", "dependency_columns", "detect",
+           "derived_values", "flag", "generated_values", "ident", "null_token_failures",
+           "null_tokens", "typed", "whitespace_failures"]

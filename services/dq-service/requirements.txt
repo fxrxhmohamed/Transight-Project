@@ -1,9 +1,10 @@
+PyYAML==6.0.3
 numpy==2.5.3
 pandas==3.0.6
 psycopg[binary]==3.3.6
 pyarrow==25.0.1
+pyspark==4.1.1
 python-dateutil==2.9.0.post0
-PyYAML==6.0.3
 six==1.17.0
 streamlit==1.65.0
 tzdata==2026.5
