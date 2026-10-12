@@ -7,17 +7,20 @@ worked through in rounds:
                 the current round: one line per field to fix, with the
                 current value and why it failed
     import      read the edited template; check every line and store the
-                accepted corrections (corrections.csv, correction_log.csv)
+                accepted corrections (dq.correction, dq.correction_log)
     revalidate  apply the corrections and run ALL rules again, together
                 with the valid records (so uniqueness and one-value-per-
                 customer are judged on the whole dataset)
-                    pass             -> RESOLVED (corrected/.../resolved.csv)
+                    pass             -> RESOLVED (dq.<dataset>_resolved)
                     fail             -> OPEN in the next round
                     fail, too often  -> MANUAL_REVIEW_REQUIRED
                     action DISCARD   -> DISCARDED
                 Records without corrections move to the next round as
                 they are.
     status      counts per status and round
+
+Everything is stored in PostgreSQL (layout.py); the template is the only
+file, written for people to fill in (e.g. in Excel).
 
 The correction UI (correction_ui.py) calls the same import and
 re-validation functions, so a fix gives the same result whichever way it
@@ -37,7 +40,7 @@ Usage
 -----
     python src/quarantine.py template   --run ING_20261011_001
     python src/quarantine.py import     --run ING_20261011_001 \\
-        --file data/quarantine/banking_transactions/ING_20261011_001/round_1/correction_template.csv
+        --file correction_template_ING_20261011_001_round_1.csv
     python src/quarantine.py revalidate --run ING_20261011_001
     python src/quarantine.py status     --run latest
 """
@@ -46,7 +49,6 @@ from __future__ import annotations
 
 import argparse
 import getpass
-import json
 import sys
 import time
 from dataclasses import dataclass
@@ -55,8 +57,10 @@ from typing import IO, Any, Callable
 
 import pandas as pd
 
-from dq_engine import DEFAULT_OUTPUT_ROOT, DEFAULT_RULES, validate_frame
+import db
+from dq_engine import DEFAULT_RULES, validate_frame
 from layout import (
+    CORRECTION_COLUMNS,
     DISCARDED,
     MANUAL_REVIEW,
     OPEN,
@@ -68,7 +72,6 @@ from layout import (
     latest_run,
     load_status,
     now_utc,
-    read_text_csv,
     save_status,
     write_csv,
 )
@@ -84,12 +87,6 @@ TEMPLATE_COLUMNS = [
     "record_id", "column", "current_value", "error_codes", "severity",
     "messages", "rule_ids", "new_value", "action", "reason",
 ]
-CORRECTION_COLUMNS = [
-    "record_id", "column", "old_value", "new_value", "action", "reason",
-    "user", "corrected_at",
-]
-LOG_COLUMNS = ["round", *CORRECTION_COLUMNS]
-
 DEFAULT_MAX_ATTEMPTS = 3
 
 
@@ -99,11 +96,8 @@ DEFAULT_MAX_ATTEMPTS = 3
 
 def open_layout(args: argparse.Namespace, registry: Registry) -> Layout:
     dataset = registry.dataset.get("name", "dataset")
-    run_id = (
-        latest_run(args.output_root, dataset) if args.run == "latest"
-        else args.run
-    )
-    return Layout(args.output_root, dataset, run_id)
+    run_id = latest_run(dataset) if args.run == "latest" else args.run
+    return Layout(dataset, run_id)
 
 
 def require_round(status: pd.DataFrame) -> int:
@@ -118,10 +112,6 @@ def open_ids(status: pd.DataFrame, round_number: int) -> set[str]:
     return set(status.loc[mask, "record_id"])
 
 
-def read_or_empty(path: Path, columns: list[str]) -> pd.DataFrame:
-    return read_text_csv(path) if path.is_file() else pd.DataFrame(columns=columns)
-
-
 # ============================================================
 # template
 # ============================================================
@@ -129,9 +119,7 @@ def read_or_empty(path: Path, columns: list[str]) -> pd.DataFrame:
 def open_errors(layout: Layout, status: pd.DataFrame, round_number: int) -> pd.DataFrame:
     """Error lines of the records still open in a round."""
 
-    errors = read_text_csv(
-        layout.quarantine_round(round_number) / "quarantine_errors.csv"
-    )
+    errors = layout.load_errors(round_number)
     return errors[errors["record_id"].isin(open_ids(status, round_number))]
 
 
@@ -168,7 +156,6 @@ def cmd_template(args: argparse.Namespace, registry: Registry) -> int:
     layout = open_layout(args, registry)
     status = load_status(layout)
     round_number = args.round or require_round(status)
-    round_dir = layout.quarantine_round(round_number)
 
     errors = open_errors(layout, status, round_number)
     if args.rule:
@@ -177,7 +164,9 @@ def cmd_template(args: argparse.Namespace, registry: Registry) -> int:
         errors = errors[errors["error_code"].isin(args.error_code)]
 
     template = build_template(errors)
-    output = args.output or round_dir / "correction_template.csv"
+    output = args.output or Path(
+        f"correction_template_{layout.run_id}_round_{round_number}.csv"
+    )
     write_csv(template, output, excel=True)
 
     print(f"Round {round_number}: {template['record_id'].nunique()} records, "
@@ -195,7 +184,6 @@ class ImportResult:
     round: int
     accepted: pd.DataFrame  # CORRECTION_COLUMNS
     refused: pd.DataFrame   # the refused lines, with the reason in 'refused'
-    corrections_file: Path
 
 
 def read_correction_file(source: Path | IO[bytes]) -> pd.DataFrame:
@@ -216,9 +204,9 @@ def import_corrections(
     """Check correction lines and store the accepted ones.
 
     lines needs record_id, column and new_value; action and reason are
-    optional. Writes corrected/round_<n>/corrections.csv (the newest line
-    per field wins), appends to the correction log and writes the refused
-    lines to import_rejections.csv. dry_run only checks: nothing is written.
+    optional. Stores the round's corrections in dq.correction (the newest
+    line per field wins), appends them to dq.correction_log and the refused
+    lines to dq.import_rejection. dry_run only checks: nothing is written.
     """
 
     status = load_status(layout)
@@ -241,9 +229,7 @@ def import_corrections(
     touched = lines["new_value"].ne("") | lines["action"].isin(RECORD_ACTIONS)
     lines = lines[touched].copy()
 
-    records = read_text_csv(
-        layout.quarantine_round(round_number) / "quarantine_records.csv"
-    ).set_index("record_id")
+    records = layout.load_quarantine(round_number).set_index("record_id")
 
     editable = {
         column for column, spec in registry.columns.items()
@@ -290,40 +276,22 @@ def import_corrections(
         corrected_at=timestamp,
     )[CORRECTION_COLUMNS]
 
-    corrected_dir = layout.corrected_round(round_number)
     if dry_run:
-        return ImportResult(
-            round=round_number,
-            accepted=accepted,
-            refused=refused,
-            corrections_file=corrected_dir / "corrections.csv",
+        return ImportResult(round=round_number, accepted=accepted, refused=refused)
+
+    with db.transaction():
+        # Merge with earlier imports for this round; the newest line wins.
+        existing = layout.load_corrections(round_number)
+        existing["column"] = existing["column"].fillna("")
+        merged = (
+            pd.concat([existing, accepted], ignore_index=True)
+            .drop_duplicates(["record_id", "column", "action"], keep="last")
         )
+        layout.replace_corrections(round_number, merged)
+        layout.append_log(round_number, accepted)
+        layout.save_rejections(round_number, refused)
 
-    # Merge with earlier imports for this round; the newest line wins.
-    existing = read_or_empty(corrected_dir / "corrections.csv", CORRECTION_COLUMNS)
-    existing["column"] = existing["column"].fillna("")
-    merged = (
-        pd.concat([existing, accepted], ignore_index=True)
-        .drop_duplicates(["record_id", "column", "action"], keep="last")
-    )
-    write_csv(merged[CORRECTION_COLUMNS], corrected_dir / "corrections.csv")
-
-    log = read_or_empty(layout.correction_log, LOG_COLUMNS)
-    log = pd.concat(
-        [log, accepted.assign(round=round_number)[LOG_COLUMNS]],
-        ignore_index=True,
-    )
-    write_csv(log, layout.correction_log)
-
-    if len(refused):
-        write_csv(refused, corrected_dir / "import_rejections.csv", excel=True)
-
-    return ImportResult(
-        round=round_number,
-        accepted=accepted,
-        refused=refused,
-        corrections_file=corrected_dir / "corrections.csv",
-    )
+    return ImportResult(round=round_number, accepted=accepted, refused=refused)
 
 
 def cmd_import(args: argparse.Namespace, registry: Registry) -> int:
@@ -333,15 +301,14 @@ def cmd_import(args: argparse.Namespace, registry: Registry) -> int:
         args.user or getpass.getuser(),
     )
     round_number, accepted, refused = result.round, result.accepted, result.refused
-    corrected_dir = result.corrections_file.parent
 
     print(f"Round {round_number}: {len(accepted)} corrections accepted "
           f"({int(accepted['action'].eq('DISCARD').sum())} discards), "
           f"{len(refused)} refused.")
-    print(f"  corrections     {corrected_dir / 'corrections.csv'}")
-    print(f"  correction log  {layout.correction_log}")
+    print("  corrections     dq.correction")
+    print("  correction log  dq.correction_log")
     if len(refused):
-        print(f"  refused lines   {corrected_dir / 'import_rejections.csv'}")
+        print("  refused lines   dq.import_rejection")
         for reason, count in refused["refused"].value_counts().items():
             print(f"    {count:>6}  {reason}")
     return 0
@@ -352,11 +319,7 @@ def cmd_import(args: argparse.Namespace, registry: Registry) -> int:
 # ============================================================
 
 def resolved_records(layout: Layout, before_round: int) -> list[pd.DataFrame]:
-    return [
-        read_text_csv(path)
-        for n in range(1, before_round)
-        if (path := layout.corrected_round(n) / "resolved.csv").is_file()
-    ]
+    return [frame for n, frame in layout.load_resolved() if n < before_round]
 
 
 def revalidate(
@@ -368,7 +331,7 @@ def revalidate(
 ) -> dict[str, Any] | None:
     """Apply the round's corrections and validate again (see module doc).
 
-    Returns the round summary (also written to dq_result.json), or None
+    Returns the round summary (also stored in dq.round_result), or None
     when there is nothing to re-validate.
     """
 
@@ -379,15 +342,11 @@ def revalidate(
     next_round = round_number + 1
     pending = open_ids(status.reset_index(), round_number)
 
-    round_dir = layout.quarantine_round(round_number)
-    records = read_text_csv(round_dir / "quarantine_records.csv")
+    records = layout.load_quarantine(round_number)
     records = records[records["record_id"].isin(pending)].set_index("record_id")
-    errors = read_text_csv(round_dir / "quarantine_errors.csv")
+    errors = layout.load_errors(round_number)
 
-    corrections = read_or_empty(
-        layout.corrected_round(round_number) / "corrections.csv",
-        CORRECTION_COLUMNS,
-    )
+    corrections = layout.load_corrections(round_number)
     corrections = corrections[corrections["record_id"].isin(pending)]
 
     discard = set(corrections.loc[corrections["action"].eq("DISCARD"), "record_id"])
@@ -416,7 +375,7 @@ def revalidate(
             )
 
     # ---- Context: the rest of the dataset, for cross-row rules ----
-    context_parts = [read_text_csv(layout.valid_file)]
+    context_parts = [layout.load_valid()]
     context_parts += resolved_records(layout, round_number)
     context_parts.append(records.loc[sorted(untouched)].reset_index())
     context = pd.concat(
@@ -468,7 +427,6 @@ def revalidate(
 
     # ---- Outputs ----
     resolved = result.valid[result.valid["record_id"].isin(passed)]
-    write_csv(resolved, layout.corrected_round(round_number) / "resolved.csv")
 
     failed_rows = result.quarantine[result.quarantine["record_id"].isin(failed)]
     carried = records.loc[sorted(untouched)].reset_index()
@@ -482,18 +440,6 @@ def revalidate(
         ],
         ignore_index=True,
     )
-
-    next_dir = layout.quarantine_round(next_round)
-    write_csv(next_records, next_dir / "quarantine_records.csv")
-    write_csv(next_errors, next_dir / "quarantine_errors.csv")
-
-    quality_dir = layout.quality_round(next_round)
-    write_csv(
-        result.audit[result.audit["record_id"].isin(target_ids)],
-        quality_dir / "remediation_audit.csv",
-    )
-
-    save_status(layout, status.reset_index())
 
     target_errors = result.errors[result.errors["record_id"].isin(failed)]
     summary = {
@@ -524,13 +470,21 @@ def revalidate(
         "status_totals": status["status"].value_counts().to_dict(),
         "rules": result.rule_stats,
         "outputs": {
-            "resolved": str(layout.corrected_round(round_number) / "resolved.csv"),
-            "next_round": str(next_dir),
-            "result": str(quality_dir / "dq_result.json"),
+            "resolved": ".".join(db.record_table_name(layout.dataset, "resolved")),
+            "next_round": ".".join(db.record_table_name(layout.dataset, "quarantine")),
+            "result": "dq.round_result",
         },
     }
-    with (quality_dir / "dq_result.json").open("w", encoding="utf-8") as handle:
-        json.dump(summary, handle, indent=2, ensure_ascii=False, default=str)
+
+    # One transaction: the round is stored completely or not at all.
+    with db.transaction():
+        layout.save_resolved(round_number, resolved)
+        layout.save_quarantine(next_round, next_records, next_errors)
+        layout.save_audit(
+            next_round, result.audit[result.audit["record_id"].isin(target_ids)],
+        )
+        save_status(layout, status.reset_index())
+        layout.save_result(next_round, summary)
 
     return summary
 
@@ -552,8 +506,8 @@ def cmd_revalidate(args: argparse.Namespace, registry: Registry) -> int:
         f"{counts['discarded'] + counts['removed_as_duplicate']}, "
         f"carried over {counts['carried_over_untouched']}."
     )
-    for key, path in summary["outputs"].items():
-        print(f"  {key:<17} {path}")
+    for key, table in summary["outputs"].items():
+        print(f"  {key:<17} {table}")
     return 0
 
 
@@ -587,7 +541,6 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--rules", type=Path, default=DEFAULT_RULES)
     parser.add_argument("--schema", type=Path, default=None)
-    parser.add_argument("--output-root", type=Path, default=DEFAULT_OUTPUT_ROOT)
 
     commands = parser.add_subparsers(dest="command", required=True)
 

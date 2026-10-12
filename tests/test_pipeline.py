@@ -5,17 +5,25 @@ each defect, listed in tests/data/expected_defects.csv with the rule that
 must catch it and the outcome. Every step runs through dq.py, as Airflow
 runs it.
 
+Every step stores its results in PostgreSQL (docker compose up -d
+postgres, or the POSTGRES_* variables of .env). The tests create a
+temporary database with sql/*.sql and drop it at the end; the user needs
+CREATEDB.
+
     python -m pytest tests
 """
 
 from __future__ import annotations
 
-import json
+import hashlib
+import os
 import subprocess
 import sys
+import uuid
 from pathlib import Path
 
 import pandas as pd
+import psycopg
 import pytest
 
 
@@ -24,6 +32,11 @@ DATA = ROOT / "tests" / "data"
 SAMPLE = DATA / "banking_sample.csv"
 DATASET = "banking_transactions"
 EXPECTED = pd.read_csv(DATA / "expected_defects.csv")
+
+sys.path.insert(0, str(ROOT))
+sys.path.insert(0, str(ROOT / "services" / "dq-service" / "src"))
+from dq import load_env  # noqa: E402
+from layout import Layout, load_status  # noqa: E402
 
 
 def dq(*args: str | Path) -> subprocess.CompletedProcess:
@@ -45,16 +58,13 @@ def read(path: Path) -> pd.DataFrame:
 
 
 class Run:
-    """Folders of one test run."""
+    """One test run: its tables (layout) and a folder for exchanged files."""
 
-    def __init__(self, root: Path, run_id: str) -> None:
-        self.root = root
+    def __init__(self, folder: Path, run_id: str) -> None:
+        self.folder = folder
         self.run_id = run_id
-        self.options = ["--raw-root", root / "raw", "--output-root", root,
-                        "--run", run_id]
-
-    def area(self, name: str) -> Path:
-        return self.root / name / DATASET / self.run_id
+        self.layout = Layout(DATASET, run_id)
+        self.options = ["--run", run_id]
 
     def record(self, row: int) -> str:
         return f"{self.run_id}_ROW_{row:06d}"
@@ -63,14 +73,46 @@ class Run:
         return list(EXPECTED.loc[EXPECTED["defect"].str.startswith(defect_prefix), "row"])
 
 
+def connect(dbname: str, **options) -> psycopg.Connection:
+    return psycopg.connect(
+        host=os.environ.get("POSTGRES_HOST", "localhost"),
+        port=int(os.environ.get("POSTGRES_PORT", "5432")),
+        user=os.environ.get("POSTGRES_USER", "metaflow"),
+        password=os.environ.get("POSTGRES_PASSWORD", "change_me_local_only"),
+        dbname=dbname, **options,
+    )
+
+
 @pytest.fixture(scope="module")
-def run(tmp_path_factory: pytest.TempPathFactory) -> Run:
+def database() -> str:
+    """A temporary bronze database for the test run (dropped afterwards)."""
+
+    load_env(ROOT / ".env")
+    os.environ.pop("METAFLOW_DB_URL", None)
+    admin_db = os.environ.get("POSTGRES_DB", "metaflow")
+    name = f"metaflow_test_{uuid.uuid4().hex[:8]}"
+
+    with connect(admin_db, autocommit=True) as admin:
+        admin.execute(f'CREATE DATABASE "{name}"')
+    try:
+        with connect(name) as conn:
+            for script in sorted((ROOT / "sql").glob("[0-9]*.sql")):
+                conn.execute(script.read_text(encoding="utf-8"))
+        os.environ["POSTGRES_DB"] = name
+        yield name
+    finally:
+        os.environ["POSTGRES_DB"] = admin_db
+        with connect(admin_db, autocommit=True) as admin:
+            admin.execute(f'DROP DATABASE IF EXISTS "{name}" WITH (FORCE)')
+
+
+@pytest.fixture(scope="module")
+def run(database: str, tmp_path_factory: pytest.TempPathFactory) -> Run:
     """Ingest, profile and validate the test dataset once."""
 
-    root = tmp_path_factory.mktemp("dq")
-    ingested = dq("ingest", "--input", SAMPLE, "--raw-root", root / "raw",
-                  "--output-root", root)
-    test_run = Run(root, ingested.stdout.strip().splitlines()[-1])
+    folder = tmp_path_factory.mktemp("dq")
+    ingested = dq("ingest", "--input", SAMPLE)
+    test_run = Run(folder, ingested.stdout.strip().splitlines()[-1])
     dq("profile", *test_run.options)
     dq("validate", *test_run.options)
     return test_run
@@ -80,22 +122,49 @@ def run(tmp_path_factory: pytest.TempPathFactory) -> Run:
 # Ingest and profile
 # ============================================================
 
-def test_ingest_keeps_an_exact_read_only_copy(run: Run) -> None:
-    folder = run.root / "raw" / DATASET / run.run_id
-    manifest = json.loads((folder / "manifest.json").read_text(encoding="utf-8"))
+def test_ingest_stores_every_row_unchanged(run: Run, database: str) -> None:
+    with connect(database) as conn:
+        sha256, row_count, columns = conn.execute(
+            "SELECT sha256, row_count, columns FROM bronze.ingestion "
+            "WHERE ingestion_id = %s", (run.run_id,),
+        ).fetchone()
+        cursor = conn.execute(
+            f"SELECT * FROM bronze.{DATASET} "
+            "WHERE ingestion_id = %s ORDER BY row_number", (run.run_id,),
+        )
+        table_columns = [column.name for column in cursor.description]
+        rows = cursor.fetchall()
 
-    assert manifest["row_count"] == 50
-    assert (folder / manifest["stored_file"]).read_bytes() == SAMPLE.read_bytes()
-    assert manifest["record_id"]["first"] == run.record(1)
+    sample = pd.read_csv(SAMPLE, dtype=str, keep_default_na=False, encoding="utf-8-sig")
+    assert sha256 == hashlib.sha256(SAMPLE.read_bytes()).hexdigest()
+    assert row_count == len(rows) == 50
+    assert columns == list(sample.columns)
+    # Laid out like the CSV: one column per source column, in order.
+    assert table_columns == ["ingestion_id", "row_number", "record_id", *columns]
+    assert rows[0][2] == run.record(1)
+    assert [list(row[3:]) for row in rows] == sample.values.tolist()
 
 
-def test_profile_is_written_and_registered(run: Run) -> None:
-    folder = run.root / "raw" / DATASET / run.run_id
-    manifest = json.loads((folder / "manifest.json").read_text(encoding="utf-8"))
-    profile = json.loads((folder / "profile.json").read_text(encoding="utf-8"))
+def test_bronze_is_append_only(run: Run, database: str) -> None:
+    for statement in (
+        f"UPDATE bronze.{DATASET} SET record_id = '' WHERE ingestion_id = %s",
+        f"DELETE FROM bronze.{DATASET} WHERE ingestion_id = %s",
+        "UPDATE bronze.ingestion SET row_count = 0 WHERE ingestion_id = %s",
+        "DELETE FROM bronze.ingestion WHERE ingestion_id = %s",
+    ):
+        with connect(database) as conn, pytest.raises(psycopg.errors.RaiseException):
+            conn.execute(statement, (run.run_id,))
 
-    assert manifest["profile"] == "profile.json"
+
+def test_profile_is_stored_with_the_ingestion(run: Run, database: str) -> None:
+    with connect(database) as conn:
+        profile = conn.execute(
+            "SELECT profile FROM bronze.ingestion WHERE ingestion_id = %s",
+            (run.run_id,),
+        ).fetchone()[0]
+
     assert profile["ingestion_id"] == run.run_id
+    assert profile["row_count"] == 50
 
 
 # ============================================================
@@ -105,10 +174,10 @@ def test_profile_is_written_and_registered(run: Run) -> None:
 @pytest.fixture(scope="module")
 def first_round(run: Run) -> dict[str, pd.DataFrame]:
     return {
-        "valid": read(run.area("validated") / "valid.csv"),
-        "quarantine": read(run.area("quarantine") / "round_1" / "quarantine_records.csv"),
-        "errors": read(run.area("quarantine") / "round_1" / "quarantine_errors.csv"),
-        "audit": read(run.area("quality") / "round_1" / "remediation_audit.csv"),
+        "valid": run.layout.load_valid(),
+        "quarantine": run.layout.load_quarantine(1),
+        "errors": run.layout.load_errors(1),
+        "audit": run.layout.load_audit(1),
     }
 
 
@@ -162,9 +231,7 @@ def test_clean_rows_pass_untouched(run: Run, first_round: dict) -> None:
 
 
 def test_counts(run: Run) -> None:
-    result = json.loads(
-        (run.area("quality") / "round_1" / "dq_result.json").read_text(encoding="utf-8")
-    )["counts"]
+    result = run.layout.load_results()[1]["counts"]
     quarantined = int((EXPECTED["outcome"] == "quarantined").sum())
     removed = int((EXPECTED["outcome"] == "removed").sum())
 
@@ -178,8 +245,17 @@ def test_counts(run: Run) -> None:
 # Correct, re-validate, merge, metrics
 # ============================================================
 
-def test_correction_flow(run: Run, first_round: dict) -> None:
-    template_file = run.root / "template.csv"
+def metrics_table(database: str, table: str, run_id: str) -> pd.DataFrame:
+    with connect(database) as conn:
+        cursor = conn.execute(
+            f"SELECT * FROM metrics.{table} WHERE run_id = %s", (run_id,),
+        )
+        return pd.DataFrame(cursor.fetchall(),
+                            columns=[column.name for column in cursor.description])
+
+
+def test_correction_flow(run: Run, first_round: dict, database: str) -> None:
+    template_file = run.folder / "template.csv"
     dq("export-template", *run.options, "--output", template_file)
     template = read(template_file).fillna("")
     assert set(template["record_id"]) == set(first_round["quarantine"]["record_id"])
@@ -206,18 +282,19 @@ def test_correction_flow(run: Run, first_round: dict) -> None:
     assert "5 corrections accepted" in imported.stdout
     dq("revalidate", *run.options)
 
-    status = read(run.area("quarantine") / "quarantine_status.csv").set_index("record_id")
+    status = load_status(run.layout).set_index("record_id")
     assert status.loc[[credit, customer, first_copy, review], "status"].eq("RESOLVED").all()
     assert status.at[second_copy, "status"] == "DISCARDED"
     still_open = status["status"].eq("OPEN")
     assert still_open.sum() == len(status) - 5
-    assert status.loc[still_open, "round"].astype(int).eq(2).all()
+    assert status.loc[still_open, "round"].eq(2).all()
 
     # ---- Merge ----
     dq("merge", *run.options)
-    clean = read(run.area("final") / "clean.csv")
-    valid = read(run.area("validated") / "valid.csv")
-    resolved = read(run.area("corrected") / "round_1" / "resolved.csv")
+    clean = run.layout.load_final()
+    valid = run.layout.load_valid()
+    [(resolved_round, resolved)] = run.layout.load_resolved()
+    assert resolved_round == 1
     assert len(clean) == len(valid) + len(resolved)
     assert not clean["record_id"].duplicated().any()
     assert clean.set_index("record_id").at[credit, "credit_score"] == "700"
@@ -225,10 +302,9 @@ def test_correction_flow(run: Run, first_round: dict) -> None:
 
     # ---- Metrics ----
     dq("metrics", *run.options)
-    metrics = run.root / "metrics" / DATASET
-    runs = read(metrics / "dq_run.csv")
+    runs = metrics_table(database, "dq_run", run.run_id).sort_values("round")
     last = runs.iloc[-1]
-    assert list(runs["round"]) == ["1", "2"]
+    assert list(runs["round"]) == [1, 2]
     assert int(last["manually_fixed_records"]) == 3
     assert int(last["confirmed_records"]) == 1
     assert int(last["discarded"]) == 1
@@ -238,11 +314,11 @@ def test_correction_flow(run: Run, first_round: dict) -> None:
     )
     assert float(last["final_dq_score"]) > float(last["initial_dq_score"])
 
-    corrections = read(metrics / "dq_correction.csv")
+    corrections = metrics_table(database, "dq_correction", run.run_id)
     manual = corrections[corrections["correction_type"].eq("manual")]
     assert set(manual["outcome"]) == {"resolved", "discarded"}
     for table in ("dq_rule_result", "dq_quarantine"):
-        assert len(read(metrics / f"{table}.csv"))
+        assert len(metrics_table(database, table, run.run_id))
 
 
 # ============================================================
@@ -252,7 +328,7 @@ def test_correction_flow(run: Run, first_round: dict) -> None:
 def test_correction_ui_renders(run: Run) -> None:
     testing = pytest.importorskip("streamlit.testing.v1")
     argv = sys.argv
-    sys.argv = ["correction_ui.py", "--output-root", str(run.root)]
+    sys.argv = ["correction_ui.py"]
     try:
         app = testing.AppTest.from_file(
             str(ROOT / "services" / "dq-service" / "src" / "correction_ui.py"),

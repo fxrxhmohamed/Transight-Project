@@ -1,8 +1,10 @@
 """Build the test dataset: clean rows plus one example of each defect.
 
-    python tests/data/build_sample.py --run ING_20261011_002
+    python tests/data/build_sample.py --run ING_20261012_001
 
-Takes rows of an ingested and validated run that passed without any
+Takes rows of an ingested and validated run (read from the database:
+bronze.<dataset>, dq.<dataset>_valid, dq.remediation_audit) that passed
+without any
 repair or warning (one per customer and account, so cross-row rules do
 not interact), then derives one defective row per defect below. Writes
 
@@ -21,6 +23,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import sys
 from datetime import datetime
 from pathlib import Path
 
@@ -32,22 +35,26 @@ HERE = Path(__file__).resolve().parent
 DATASET = "banking_transactions"
 CLEAN_ROWS = 20
 
-
-def read_text(path: Path) -> pd.DataFrame:
-    return pd.read_csv(path, dtype=str, keep_default_na=False, encoding="utf-8-sig")
+sys.path.insert(0, str(ROOT))
+sys.path.insert(0, str(ROOT / "services" / "dq-service" / "src"))
+from dq import load_env  # noqa: E402
+from layout import Layout  # noqa: E402
+from db import bronze  # noqa: E402
 
 
 def clean_rows(run: str, count: int) -> pd.DataFrame:
-    raw_dir = ROOT / "data" / "raw" / DATASET / run
-    raw = read_text(next(p for p in raw_dir.glob("*.csv")))
-    width = len(str(len(raw)))
+    with bronze.connect() as conn:
+        ingestion = bronze.find_ingestion(conn, DATASET, run)
+        raw = bronze.read_frame(conn, ingestion)
+    prefix, width = ingestion["record_id"]["prefix"], ingestion["record_id"]["width"]
     raw.insert(0, "record_id", [
-        f"{run}_ROW_{n:0{max(6, width)}d}" for n in range(1, len(raw) + 1)
+        f"{prefix}{n:0{width}d}" for n in range(1, len(raw) + 1)
     ])
 
-    valid = read_text(ROOT / "data" / "validated" / DATASET / run / "valid.csv")
-    audit = read_text(ROOT / "data" / "quality" / DATASET / run / "round_1" / "remediation_audit.csv")
-    passed = set(valid.loc[valid["dq_warnings"].eq(""), "record_id"]) - set(audit["record_id"])
+    layout = Layout(DATASET, run)
+    valid = layout.load_valid()
+    audit = layout.load_audit(1)
+    passed = set(valid.loc[valid["dq_warnings"].isna(), "record_id"]) - set(audit["record_id"])
 
     rows = raw[raw["record_id"].isin(passed)]
     # Variety (several channels and types) and no shared customer/account.
@@ -201,6 +208,7 @@ def main() -> int:
     parser.add_argument("--run", required=True,
                         help="A validated ingestion to take clean rows from.")
     args = parser.parse_args()
+    load_env(ROOT / ".env")
 
     sample, expected = build(args.run)
     sample.to_csv(HERE / "banking_sample.csv", index=False, quoting=csv.QUOTE_MINIMAL)

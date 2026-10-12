@@ -3,24 +3,28 @@
     python dq.py <step> [options]
 
 Steps, in pipeline order
-    ingest              land a source file in the raw layer; prints the new
-                        ingestion id as the last line (Airflow XCom)
-    profile             profile an ingestion (profile.json)
+    ingest              load a source file into the bronze layer (PostgreSQL);
+                        prints the new ingestion id as the last line
+                        (Airflow XCom)
+    profile             profile an ingestion (stored with it in bronze)
     validate            validate an ingestion: valid records, quarantine,
                         remediation audit
-    export-template     correction template for the open quarantine round
+    export-template     correction template (CSV) for the open quarantine round
     import-corrections  import a filled-in template (--file)
     revalidate          apply the corrections and validate again
-    merge               valid + resolved records -> final clean.csv
-    metrics             the DQ metric tables for Power BI
+    merge               valid + resolved records -> silver.<dataset>
+    metrics             the DQ metric tables for Power BI (metrics schema)
+    import-files        load runs kept in data/ by earlier versions into
+                        the database (once)
 Helpers
     status              quarantine counts per status and round
     ui                  start the correction UI (Streamlit)
     pipeline            ingest, profile, validate, merge and metrics in one go
 
-Every step takes --run (an ingestion id, default 'latest') and the shared
-folders --raw-root, --output-root and --rules, and passes the options to
-the service script that does the work:
+Every step takes --run (an ingestion id, default 'latest') and --rules,
+and passes the options to the service script that does the work. Every
+step reads and writes PostgreSQL (sql/01_bronze.sql, sql/02_dq.sql); the
+database comes from the POSTGRES_* environment variables (see .env.example):
 
     ingest              services/ingestion-service/src/ingest.py
     profile             services/metadata-service/src/profiler.py
@@ -30,6 +34,7 @@ the service script that does the work:
     revalidate, status  services/dq-service/src/quarantine.py
     merge               services/dq-service/src/merge.py
     metrics             services/dq-service/src/metrics.py
+    import-files        services/dq-service/src/import_files.py
 
 Exit code: the step's own (0 = success).
 
@@ -43,6 +48,7 @@ Examples
 from __future__ import annotations
 
 import argparse
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -60,11 +66,23 @@ ENGINE = DQ / "dq_engine.py"
 QUARANTINE = DQ / "quarantine.py"
 MERGE = DQ / "merge.py"
 METRICS = DQ / "metrics.py"
+IMPORT_FILES = DQ / "import_files.py"
 UI = DQ / "correction_ui.py"
 
 DEFAULT_RULES = ROOT / "config" / "rules" / "quality_rules.yaml"
-DEFAULT_RAW_ROOT = ROOT / "data" / "raw"
-DEFAULT_OUTPUT_ROOT = ROOT / "data"
+DEFAULT_DATA = ROOT / "data"
+
+
+def load_env(path: Path) -> None:
+    """KEY=value lines of .env, for settings not already in the environment
+    (the same file docker compose reads, so both use one database)."""
+
+    if not path.is_file():
+        return
+    for line in path.read_text(encoding="utf-8-sig").splitlines():
+        key, sep, value = line.partition("=")
+        if sep and not key.strip().startswith("#"):
+            os.environ.setdefault(key.strip(), value.strip().strip("\"'"))
 
 
 def dataset_name(rules: Path) -> str:
@@ -82,7 +100,6 @@ def dataset_name(rules: Path) -> str:
 def quarantine(args: argparse.Namespace, command: str, *extra: str) -> list[str]:
     return [
         str(QUARANTINE), "--rules", str(args.rules),
-        "--output-root", str(args.output_root),
         command, "--run", args.run, *extra,
     ]
 
@@ -91,21 +108,17 @@ def command_line(step: str, args: argparse.Namespace) -> list[str]:
     """Arguments for the service script of one step (without python)."""
 
     if step == "ingest":
-        line = [str(INGEST), "--raw-root", str(args.raw_root),
-                "--dataset", dataset_name(args.rules)]
+        line = [str(INGEST), "--dataset", dataset_name(args.rules)]
         if args.input:
             line += ["--input", str(args.input)]
         return line
 
     if step == "profile":
         return [str(PROFILER), "--ingestion", args.run,
-                "--raw-root", str(args.raw_root),
                 "--dataset-name", dataset_name(args.rules)]
 
     if step == "validate":
-        line = [str(ENGINE), "--ingestion", args.run, "--rules", str(args.rules),
-                "--raw-root", str(args.raw_root),
-                "--output-root", str(args.output_root)]
+        line = [str(ENGINE), "--ingestion", args.run, "--rules", str(args.rules)]
         return line + (["--force"] if getattr(args, "force", False) else [])
 
     if step == "export-template":
@@ -132,13 +145,16 @@ def command_line(step: str, args: argparse.Namespace) -> list[str]:
         return quarantine(args, "status")
 
     if step == "merge":
-        return [str(MERGE), "--run", args.run, "--rules", str(args.rules),
-                "--output-root", str(args.output_root)]
+        return [str(MERGE), "--run", args.run, "--rules", str(args.rules)]
 
     if step == "metrics":
         return [str(METRICS), "--run", "all" if args.run == "latest" else args.run,
-                "--rules", str(args.rules),
-                "--output-root", str(args.output_root)]
+                "--rules", str(args.rules)]
+
+    if step == "import-files":
+        return [str(IMPORT_FILES), "--rules", str(args.rules),
+                "--data", str(args.data.resolve()),
+                "--run", "all" if args.run == "latest" else args.run]
 
     raise ValueError(step)
 
@@ -179,8 +195,6 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     shared.add_argument("--run", default="latest",
                         help="Ingestion id, or 'latest' (default).")
     shared.add_argument("--rules", type=Path, default=DEFAULT_RULES)
-    shared.add_argument("--raw-root", type=Path, default=DEFAULT_RAW_ROOT)
-    shared.add_argument("--output-root", type=Path, default=DEFAULT_OUTPUT_ROOT)
 
     parser = argparse.ArgumentParser(
         prog="dq.py", description="Run one data-quality step.",
@@ -192,7 +206,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         return steps.add_parser(name, parents=[shared], help=help_text)
 
     for name, help_text in (
-        ("ingest", "Land a source file."),
+        ("ingest", "Load a source file into bronze."),
         ("pipeline", "Ingest, profile, validate, merge and metrics."),
     ):
         add(name, help_text).add_argument(
@@ -220,8 +234,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     revalidate.add_argument("--max-attempts", type=int, default=3)
     revalidate.add_argument("--all", action="store_true")
 
-    add("merge", "Merge valid and resolved records into clean.csv.")
-    add("metrics", "Write the DQ metric tables (default: every run).")
+    add("merge", "Merge valid and resolved records into silver.<dataset>.")
+    add("metrics", "Rebuild the DQ metric tables (default: every run).")
+    add("import-files", "Load runs kept in data/ by earlier versions "
+        "(default: every run).").add_argument(
+        "--data", type=Path, default=DEFAULT_DATA,
+        help="Folder holding validated/, quarantine/, corrected/, quality/.",
+    )
     add("status", "Show quarantine counts.")
     add("ui", "Start the correction UI.")
 
@@ -230,15 +249,15 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
-    for name in ("rules", "raw_root", "output_root"):
-        setattr(args, name, getattr(args, name).resolve())
+    load_env(ROOT / ".env")
+    args.rules = args.rules.resolve()
 
     if args.step == "pipeline":
         return run_pipeline(args)
     if args.step == "ui":
         return subprocess.run(
             [sys.executable, "-m", "streamlit", "run", str(UI), "--",
-             "--rules", str(args.rules), "--output-root", str(args.output_root)],
+             "--rules", str(args.rules)],
             cwd=ROOT,
         ).returncode
     return run(command_line(args.step, args))

@@ -7,6 +7,29 @@ on:
 jobs:
   test:
     runs-on: ubuntu-latest
+
+    # Bronze layer database; the tests create and drop their own database
+    # in it.
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_DB: metaflow
+          POSTGRES_USER: metaflow
+          POSTGRES_PASSWORD: ci_only
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U metaflow -d metaflow"
+          --health-interval 5s --health-retries 10
+
+    env:
+      POSTGRES_HOST: localhost
+      POSTGRES_PORT: "5432"
+      POSTGRES_DB: metaflow
+      POSTGRES_USER: metaflow
+      POSTGRES_PASSWORD: ci_only
+
     steps:
       - uses: actions/checkout@v4
 

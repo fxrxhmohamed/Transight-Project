@@ -5,8 +5,12 @@ ENV PYTHONUNBUFFERED=1
 
 WORKDIR /app
 
-# Standard library only: no requirements to install.
+COPY services/ingestion-service/requirements.txt ./requirements.txt
+
+RUN pip install --no-cache-dir -r requirements.txt
+
 COPY services/ingestion-service/src/ ./src/
 
-# Mount data/ at /app/data at run time.
+# Mount the source files at run time; the database comes from the
+# POSTGRES_* environment variables (see .env.example).
 ENTRYPOINT ["python", "/app/src/ingest.py"]

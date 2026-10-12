@@ -1,7 +1,7 @@
-"""Lineage and DQ metrics: four tables for PostgreSQL / Power BI.
+"""Lineage and DQ metrics: four tables in PostgreSQL for Power BI.
 
-Built from the files every step leaves behind (dq_result.json per round,
-remediation audits, the quarantine history, corrections and the
+Built from what every step stores in the dq schema (the summary of every
+round, remediation audits, the quarantine history, corrections and the
 correction log), for every run of the dataset:
 
     dq_run          one row per run and round: record counts and DQ score
@@ -11,9 +11,8 @@ correction log), for every run of the dataset:
     dq_correction   every automatic repair (remediation audit) and manual
                     correction (correction log), with its outcome
 
-written to data/metrics/<dataset>/<table>.csv (UTF-8, header row). The
-tables are rebuilt from scratch each time, so they can be truncated and
-reloaded.
+stored in metrics.<table>. The rows of the runs being measured are
+replaced each time, so the tables always match the dq schema.
 
 Definitions (dq_run)
 --------------------
@@ -47,14 +46,15 @@ Usage
 from __future__ import annotations
 
 import argparse
-import json
 import sys
 from pathlib import Path
 from typing import Any
 
 import pandas as pd
+from psycopg import sql
 
-from dq_engine import DEFAULT_OUTPUT_ROOT, DEFAULT_RULES
+import db
+from dq_engine import DEFAULT_RULES
 from layout import (
     DISCARDED,
     MANUAL_REVIEW,
@@ -64,8 +64,6 @@ from layout import (
     LayoutError,
     list_runs,
     load_history,
-    read_text_csv,
-    write_csv,
 )
 from registry import ConfigError, load_registry
 
@@ -104,26 +102,12 @@ MANUAL_OUTCOMES = {
 # ============================================================
 
 def read_rounds(layout: Layout) -> dict[int, dict[str, Any]]:
-    """dq_result.json of every round, by round number."""
+    """Summary of every round, by round number."""
 
-    rounds = {}
-    for path in layout.quality_round(1).parent.glob("round_*/dq_result.json"):
-        number = int(path.parent.name.removeprefix("round_"))
-        rounds[number] = json.loads(path.read_text(encoding="utf-8"))
-
+    rounds = layout.load_results()
     if 1 not in rounds:
-        raise LayoutError(f"Run {layout.run_id} has no round 1 dq_result.json")
-    return dict(sorted(rounds.items()))
-
-
-def read_ids(path: Path) -> set[str]:
-    if not path.is_file():
-        return set()
-    return set(pd.read_csv(path, usecols=["record_id"], dtype="string")["record_id"])
-
-
-def read_optional(path: Path) -> pd.DataFrame | None:
-    return read_text_csv(path) if path.is_file() else None
+        raise LayoutError(f"Run {layout.run_id} has no round 1 result")
+    return rounds
 
 
 def score(part: int, whole: int) -> float:
@@ -144,15 +128,13 @@ def run_table(
     valid = counts["accepted_rows"]
     quarantined = counts["quarantined_rows"]
 
-    quarantined_ids = read_ids(layout.quarantine_round(1) / "quarantine_records.csv")
+    quarantined_ids = set(layout.load_quarantine(1, columns=[])["record_id"])
 
-    audit = read_optional(layout.quality_round(1) / "remediation_audit.csv")
-    auto_fixed = 0
-    if audit is not None:
-        fixed = audit[audit["outcome"].isin(AUTO_FIX_OUTCOMES)]
-        auto_fixed = int(
-            fixed.loc[~fixed["record_id"].isin(quarantined_ids), "record_id"].nunique()
-        )
+    audit = layout.load_audit(1)
+    fixed = audit[audit["outcome"].isin(AUTO_FIX_OUTCOMES)]
+    auto_fixed = int(
+        fixed.loc[~fixed["record_id"].isin(quarantined_ids), "record_id"].nunique()
+    )
 
     base = {
         "run_id": layout.run_id,
@@ -172,6 +154,7 @@ def run_table(
         "initial_dq_score": score(valid, processed),
     }
 
+    resolved_by_round = dict(layout.load_resolved())
     rows = []
     resolved_total = manual_fixed = confirmed = 0
     discarded_total = manual_review_total = 0
@@ -191,15 +174,17 @@ def run_table(
         else:
             round_counts = result["counts"]
             k = result["revalidated_round"]
-            corrections = read_optional(layout.corrected_round(k) / "corrections.csv")
+            corrections = layout.load_corrections(k)
+
             def ids_with(action: str) -> set[str]:
-                if corrections is None:
-                    return set()
                 return set(corrections.loc[corrections["action"].eq(action), "record_id"])
 
             fixed_ids = ids_with("FIX")
             accepted_ids = ids_with("ACCEPT") - fixed_ids
-            resolved_ids = read_ids(layout.corrected_round(k) / "resolved.csv")
+            resolved_ids = (
+                set(resolved_by_round[k]["record_id"]) if k in resolved_by_round
+                else set()
+            )
 
             resolved_total += round_counts["resolved"]
             manual_fixed += len(resolved_ids & fixed_ids)
@@ -305,8 +290,8 @@ def correction_table(
 
     # ---- Automatic repairs ----
     for number, result in rounds.items():
-        audit = read_optional(layout.quality_round(number) / "remediation_audit.csv")
-        if audit is None or not len(audit):
+        audit = layout.load_audit(number)
+        if not len(audit):
             continue
         parts.append(pd.DataFrame({
             "round": number,
@@ -324,8 +309,8 @@ def correction_table(
         }))
 
     # ---- Manual corrections ----
-    log = read_optional(layout.correction_log)
-    if log is not None and len(log):
+    log = layout.load_log()
+    if len(log):
         log = log.assign(round=log["round"].astype(int))
 
         # The record's status right after its round was re-validated.
@@ -385,46 +370,46 @@ def build_tables(layout: Layout) -> dict[str, pd.DataFrame]:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Write the DQ metric tables (dq_run, dq_rule_result, "
-        "dq_quarantine, dq_correction) for Power BI.",
+        description="Rebuild the DQ metric tables (metrics.dq_run, "
+        "dq_rule_result, dq_quarantine, dq_correction) for Power BI.",
     )
     parser.add_argument("--run", default="all",
                         help="Run (ingestion) id, or 'all' (default).")
     parser.add_argument("--rules", type=Path, default=DEFAULT_RULES)
     parser.add_argument("--schema", type=Path, default=None)
-    parser.add_argument("--output-root", type=Path, default=DEFAULT_OUTPUT_ROOT)
-    parser.add_argument(
-        "--metrics-dir", type=Path, default=None,
-        help="Where to write the tables (default: <output root>/metrics/<dataset>).",
-    )
     return parser.parse_args()
 
 
 def export_metrics(
-    output_root: Path,
     dataset: str,
     runs: list[str] | None = None,
-    metrics_dir: Path | None = None,
-) -> dict[str, tuple[pd.DataFrame, Path]]:
-    """Build the four tables for some runs (default: all) and write them."""
+) -> dict[str, pd.DataFrame]:
+    """Build the four tables for some runs (default: all) and store them in
+    metrics.<table>, replacing those runs' rows."""
 
-    runs = runs or list_runs(output_root, dataset)
+    every_run = runs is None
+    runs = runs or list_runs(dataset)
     if not runs:
-        raise LayoutError(f"No validated runs for {dataset} under {output_root}")
+        raise LayoutError(f"No validated runs for {dataset}")
 
     parts: dict[str, list[pd.DataFrame]] = {name: [] for name in TABLES}
     for run_id in runs:
-        for name, frame in build_tables(Layout(output_root, dataset, run_id)).items():
+        for name, frame in build_tables(Layout(dataset, run_id)).items():
             if len(frame):
                 parts[name].append(frame)
 
-    metrics_dir = metrics_dir or output_root / "metrics" / dataset
     written = {}
-    for name, frames in parts.items():
-        table = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
-        path = metrics_dir / f"{name}.csv"
-        write_csv(table, path)
-        written[name] = (table, path)
+    with db.transaction() as conn:
+        for name, frames in parts.items():
+            table = sql.Identifier("metrics", name)
+            if every_run:
+                db.delete(conn, table, {"dataset": dataset})
+            else:
+                for run_id in runs:
+                    db.delete(conn, table, {"dataset": dataset, "run_id": run_id})
+            frame = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
+            db.write_frame(conn, table, frame)
+            written[name] = frame
     return written
 
 
@@ -433,12 +418,9 @@ def main() -> int:
     registry = load_registry(args.rules, args.schema)
     dataset = registry.dataset.get("name", "dataset")
 
-    written = export_metrics(
-        args.output_root, dataset,
-        None if args.run == "all" else [args.run], args.metrics_dir,
-    )
+    written = export_metrics(dataset, None if args.run == "all" else [args.run])
 
-    runs = written["dq_run"][0]
+    runs = written["dq_run"]
     for run_id, rows in runs.groupby("run_id", sort=False):
         last = rows.iloc[-1]
         print(
@@ -452,8 +434,8 @@ def main() -> int:
             f"{last['initial_dq_score']:.2%} -> {last['final_dq_score']:.2%}"
         )
 
-    for name, (table, path) in written.items():
-        print(f"  {name:<15} {len(table):>9} rows  {path}")
+    for name, table in written.items():
+        print(f"  metrics.{name:<15} {len(table):>9} rows")
 
     return 0
 
@@ -463,9 +445,4 @@ if __name__ == "__main__":
         sys.exit(main())
     except (ConfigError, LayoutError) as error:
         print(f"Error: {error}", file=sys.stderr)
-        sys.exit(2)
-    except PermissionError as error:
-        print(f"Error: cannot write {error.filename}; it is probably open in "
-              "another program (e.g. Excel). Close it and run again.",
-              file=sys.stderr)
         sys.exit(2)

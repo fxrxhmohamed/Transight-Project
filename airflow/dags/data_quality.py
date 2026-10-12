@@ -14,9 +14,10 @@ does in Airflow exactly what the same command does by hand.
                           day into the clean data (the UI's Publish button).
 
 Environment of the Airflow workers
-    METAFLOW_HOME    project folder holding dq.py, config/ and data/
+    METAFLOW_HOME    project folder holding dq.py and config/
                      (default /opt/metaflow)
     METAFLOW_PYTHON  Python with the services' requirements (default python)
+    POSTGRES_*       the database every step reads and writes
 """
 
 from __future__ import annotations

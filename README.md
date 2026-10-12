@@ -10,17 +10,71 @@ unchanged, validates and repairs it, holds back the records it cannot
 trust, lets people correct them (in the browser or with a file), merges
 the result into a clean dataset and reports data-quality metrics for
 Power BI. Every record keeps one id from ingestion to the final dataset.
+Everything is stored in PostgreSQL; the only files are the source CSV and
+the correction templates people fill in.
 
 ```
 source CSV
-  -> ingest       read-only copy, ingestion id, manifest
-  -> profile      profile.json
-  -> validate     valid records | quarantine (+ why) | repair audit
+  -> ingest       bronze.<dataset>, ingestion id
+  -> profile      profile stored with the ingestion
+  -> validate     dq.<dataset>_valid | dq.<dataset>_quarantine (+ why) | repair audit
   -> correct      correction UI or a correction file   <- people
   -> revalidate   fixed records resolved, the rest back to quarantine
-  -> merge        final clean.csv (valid + resolved)
-  -> metrics      dq_run, dq_rule_result, dq_quarantine, dq_correction
+  -> merge        silver.<dataset> (valid + resolved)
+  -> metrics      metrics.dq_run, dq_rule_result, dq_quarantine, dq_correction
 ```
+
+## Project structure
+
+```
+MetaFlow-DQ/
+├── dq.py                        one command per pipeline step (python dq.py --help)
+├── docker-compose.yml           PostgreSQL + Airflow for local use
+├── .env.example                 database settings (copy to .env)
+│
+├── config/
+│   ├── metadata/schema_registry.yaml   columns, types, allowed values, entities
+│   ├── rules/quality_rules.yaml        severities, repairs, business rules
+│   └── reference/                      lookup files (banks, branches)
+│
+├── sql/
+│   ├── 01_bronze.sql            bronze schema (ingestion catalog, append-only)
+│   └── 02_dq.sql                dq, silver and metrics schemas
+│
+├── services/
+│   ├── ingestion-service/src/   ingest.py   load a CSV into bronze
+│   │                            bronze.py   bronze database client (shared)
+│   ├── metadata-service/src/    profiler.py profile an ingestion
+│   └── dq-service/src/
+│       ├── dq_engine.py         validate: valid | quarantine | repair audit
+│       ├── registry.py          load the schema registry and rules
+│       ├── checks.py            rule checks
+│       ├── remediation.py       automatic repairs
+│       ├── values.py            typed values and canonical formats
+│       ├── quarantine.py        correction template, import, re-validation
+│       ├── merge.py             valid + resolved -> silver.<dataset>
+│       ├── metrics.py           metrics.* tables for Power BI
+│       ├── correction_ui.py     Streamlit correction UI
+│       ├── correction_assist.py wording and suggestions for the UI
+│       ├── layout.py            which table holds which output of a run
+│       ├── db.py                PostgreSQL access (transactions, COPY)
+│       └── import_files.py      load runs kept in data/ by earlier versions
+│
+├── airflow/
+│   ├── Dockerfile               Airflow image with the pipeline's Python
+│   └── dags/data_quality.py     DAGs, one dq.py step per task
+│
+├── tests/
+│   ├── test_pipeline.py         end-to-end tests of every dq.py step
+│   └── data/                    50-row test dataset and its expected defects
+│
+├── .github/workflows/           CI: the tests against PostgreSQL
+└── data/raw/banking/            source files to ingest (local, not in git)
+```
+
+Each service has its own `Dockerfile` and `requirements.txt`. Records are
+identified by `<ingestion id>_ROW_<row number>` from ingestion to the
+clean data.
 
 ## Setup
 
@@ -34,8 +88,102 @@ python -m pip install -r services/dq-service/requirements.txt \
 ```
 
 The data is not in the repository. Put the source file at
-`data/raw/banking/banking_transactions.csv`; everything the pipeline
-writes goes under `data/` (ignored by git).
+`data/raw/banking/banking_transactions.csv`. Ingestion loads it into the
+bronze layer in PostgreSQL (below), and every later step reads and writes
+the database too.
+
+## Database (PostgreSQL)
+
+### Bronze
+
+`sql/01_bronze.sql` creates the ingestion catalog; the first ingestion of
+a dataset creates its table:
+
+| Table | One row per |
+|---|---|
+| `bronze.ingestion` | ingestion: source file, SHA-256, row count, columns, record id format, time, profile (JSON) |
+| `bronze.<dataset>` (e.g. `bronze.banking_transactions`) | source row, laid out like the CSV: `ingestion_id`, `row_number`, `record_id`, then one `text` column per source column with the value exactly as read |
+
+All are append-only: triggers refuse updates and deletes (only the
+profile of an ingestion may be filled in). A later ingestion with new
+columns adds them to the table (NULL for earlier rows).
+`bronze.ingestion_summary` lists the ingestions and the table holding each.
+
+### Data quality, silver and metrics
+
+`sql/02_dq.sql` creates the `dq`, `silver` and `metrics` schemas. Record
+tables are created per dataset, with `record_id` and one `text` column per
+data column (values as the engine cleaned them):
+
+| Table | One row per |
+|---|---|
+| `dq.run` | validated run (ingestion): its record columns |
+| `dq.<dataset>_valid` | record that passed the first validation, with its warnings |
+| `dq.<dataset>_quarantine` | record open in a round, with its cleaned values |
+| `dq.quarantine_error` | failed rule, record and round: code, severity, column, value, message |
+| `dq.quarantine_status` | quarantined record: status, round, attempts (the ledger) |
+| `dq.quarantine_history` | status change of a quarantined record |
+| `dq.remediation_audit` | automatic repair: column, before, after, rule, outcome |
+| `dq.correction` | manual correction to apply when its round is re-validated |
+| `dq.correction_log` | manual correction ever imported, with who and when |
+| `dq.import_rejection` | correction line that was refused, with the reason |
+| `dq.<dataset>_resolved` | record that passed re-validation, per round |
+| `dq.round_result` | round of a run: its summary (JSON) |
+| `silver.<dataset>` | record of the clean data: valid + resolved, per run |
+| `dq.merge_result` | run: counts and checks of its latest merge |
+| `metrics.*` | see [Data quality metrics](#data-quality-metrics) |
+
+Each step writes its tables in one transaction, so a step that fails
+leaves nothing half written. Older database volumes get the `dq` tables
+on the first run of a step.
+
+### Setting it up
+
+With Docker (creates the database and runs `sql/` on its first start):
+
+```bash
+cp .env.example .env              # optional: change the password here
+docker compose up -d postgres     # localhost:5432
+```
+
+Without Docker, on an installed PostgreSQL 14 or later:
+
+```bash
+psql -U postgres -c "CREATE ROLE metaflow LOGIN CREATEDB PASSWORD 'change_me_local_only'"
+psql -U postgres -c "CREATE DATABASE metaflow OWNER metaflow"
+psql -U metaflow -d metaflow -f sql/01_bronze.sql
+psql -U metaflow -d metaflow -f sql/02_dq.sql
+```
+
+The scripts connect with `POSTGRES_HOST`, `POSTGRES_PORT`, `POSTGRES_DB`,
+`POSTGRES_USER` and `POSTGRES_PASSWORD` (environment, or `.env`, which
+`dq.py` reads; defaults as in `.env.example`), or with `METAFLOW_DB_URL`
+if set.
+
+```sql
+SELECT * FROM bronze.ingestion_summary;
+SELECT record_id, transaction_id FROM bronze.banking_transactions
+WHERE ingestion_id = 'ING_20261012_001' ORDER BY row_number LIMIT 10;
+
+SELECT status, round, count(*) FROM dq.quarantine_status
+WHERE run_id = 'ING_20261012_001' GROUP BY 1, 2;
+SELECT * FROM silver.banking_transactions LIMIT 100;
+```
+
+### Runs from earlier versions
+
+Earlier versions wrote the outputs to CSV and JSON files under `data/`.
+Load those runs (with their rounds, ledger history and corrections) into
+the database once, then rebuild the metrics:
+
+```bash
+python dq.py import-files            # every run under data/; --run <id> for one
+python dq.py metrics
+```
+
+Runs already in the database are skipped. The files are left as they
+are; delete `data/validated`, `quarantine`, `corrected`, `quality`,
+`final` and `metrics` once the import is checked.
 
 ## Run the pipeline
 
@@ -43,11 +191,11 @@ Every step is one command of `dq.py`, run from the project root. Each
 calls the service script that does the work (`python dq.py --help`).
 
 ```bash
-# 1. Ingest: read-only copy, ingestion id, manifest, record ids
+# 1. Ingest: load into bronze with an ingestion id and record ids
 #    (the last output line is the new ingestion id)
 python dq.py ingest --input data/raw/banking/banking_transactions.csv
 
-# 2. Profile the ingested copy (profile.json next to the manifest)
+# 2. Profile the ingestion (stored in bronze.ingestion.profile)
 python dq.py profile
 
 # 3-4. Validate: valid records, quarantine round 1 with one error line per
@@ -63,10 +211,11 @@ python dq.py import-corrections --file fixes.csv
 python dq.py revalidate
 python dq.py status
 
-# 7. Merge into the clean dataset: valid + resolved, one row per record
+# 7. Merge into the clean dataset (silver.<dataset>): valid + resolved,
+#    one row per record
 python dq.py merge
 
-# 8. Data-quality metric tables for PostgreSQL / Power BI (all runs)
+# 8. Data-quality metric tables for Power BI (metrics schema, all runs)
 python dq.py metrics
 
 # Steps 1, 2, 3-4, 7 and 8 in one go
@@ -74,9 +223,9 @@ python dq.py pipeline --input data/raw/banking/banking_transactions.csv
 ```
 
 Every step works on the latest ingestion unless given `--run <ingestion
-id>`, and takes `--raw-root`, `--output-root` and `--rules` to use other
-folders. `validate --force` starts a run over (it removes that run's
-quarantine rounds and corrections).
+id>`, and takes `--rules` to use another rules file. `validate --force`
+starts a run over (it removes that run's quarantine rounds, corrections
+and clean data).
 
 ### Correction file
 
@@ -91,8 +240,9 @@ One line per field to check. Fill in only these columns:
 | leave it for later | empty | empty |
 
 `reason` is optional and kept in the correction log. Lines that are not
-filled in are ignored; lines that cannot be used are listed with the
-reason in `import_rejections.csv`.
+filled in are ignored; lines that cannot be used are stored with the
+reason in `dq.import_rejection`. Without `--output`, `export-template`
+writes `correction_template_<run>_round_<n>.csv` in the project folder.
 
 ## Correction UI
 
@@ -117,7 +267,7 @@ python dq.py ui
   identical to uploading the same fixes as a file.
 - **Progress**: fixed, removed, waiting, needing an expert.
   **Publish to clean data** runs the merge and the metrics; fixed records
-  reach `clean.csv` only when published (e.g. once a day).
+  reach `silver.<dataset>` only when published (e.g. once a day).
 - **Upload a file**: download the list of problems, fill it in (e.g. in
   Excel), upload it; it is checked before anything is sent.
 
@@ -139,14 +289,16 @@ Locally with Docker (Airflow 3, no login, for development only):
 ```bash
 docker compose --progress plain build    # first time: several minutes
 docker compose up -d                     # http://localhost:8080
-docker compose down                      # stop; data stays in data/
+docker compose down                      # stop; data stays in the
+                                         # postgres-data volume
 ```
 
-The project folder is mounted at `/opt/metaflow`, so the DAGs use the same
-`data/` folder as the commands and the UI. The pipeline runs in its own
+The project folder is mounted at `/opt/metaflow` (code, config, source
+files), and the DAGs use the same database as the commands and the UI.
+The pipeline runs in its own
 virtual environment inside the image. Elsewhere, Airflow workers need
-`METAFLOW_HOME` (the project folder) and `METAFLOW_PYTHON` (a Python with
-the requirements above).
+`METAFLOW_HOME` (the project folder), `METAFLOW_PYTHON` (a Python with
+the requirements above) and the `POSTGRES_*` variables.
 
 ## Tests and CI
 
@@ -159,10 +311,13 @@ and checks each defect.
 
 ```bash
 python -m pip install pytest
+docker compose up -d postgres     # the tests need PostgreSQL
 python -m pytest tests
 ```
 
-GitHub Actions runs the same tests on every push and pull request
+The tests create a temporary database (`metaflow_test_*`) and drop it at
+the end, so the user in `.env` needs `CREATEDB`. GitHub Actions runs the
+same tests, with a PostgreSQL service, on every push and pull request
 (`.github/workflows/data-quality.yml`). `tests/data/build_sample.py`
 rebuilds the dataset from a validated run.
 
@@ -180,7 +335,8 @@ repair: `critical` -> quarantine, `warning` -> accepted and flagged,
 
 ## Data quality metrics
 
-`python dq.py metrics` rebuilds four tables in `data/metrics/<dataset>/`:
+`python dq.py metrics` rebuilds four tables in the `metrics` schema (the
+rows of the runs it measures are replaced); connect Power BI to them:
 
 | Table | One row per |
 |---|---|
@@ -197,28 +353,3 @@ repair: `critical` -> quarantine, `warning` -> accepted and flagged,
 
 The latest round of a run gives the funnel directly, e.g. 350 with
 issues -> 200 auto-fixed -> 130 manually fixed -> 20 unresolved.
-
-## Where things are
-
-| Path | Content |
-|---|---|
-| `dq.py` | one command per pipeline step |
-| `services/ingestion-service/` | ingestion (`ingest.py`) |
-| `services/metadata-service/` | profiler (`profiler.py`) |
-| `services/dq-service/` | validation engine, quarantine and re-validation, merge, metrics, correction UI |
-| `airflow/` | DAGs and the Airflow image |
-| `tests/` | test dataset and end-to-end tests |
-| `data/raw/<dataset>/<ING id>/` | read-only source copy, `manifest.json`, `profile.json` |
-| `data/validated/<dataset>/<ING id>/valid.csv` | records that passed validation |
-| `data/quarantine/<dataset>/<ING id>/` | status and status history of every quarantined record; open records and their errors per round |
-| `data/corrected/<dataset>/<ING id>/round_<n>/` | imported corrections, refused lines, records resolved in that round |
-| `data/quality/<dataset>/<ING id>/` | `dq_result.json` and repair audit per round, `correction_log.csv` |
-| `data/final/<dataset>/<ING id>/clean.csv` | clean dataset: valid + resolved records |
-| `data/metrics/<dataset>/` | the metric tables |
-
-Records are identified by `<ingestion id>_ROW_<row number>` from ingestion
-to the final dataset.
-
-`clean.csv` holds about a million rows, close to Excel's limit of
-1,048,576; open it in Power BI or pandas instead, and close it in any
-program before `merge` (an open file cannot be overwritten on Windows).

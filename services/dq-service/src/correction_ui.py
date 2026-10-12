@@ -1,7 +1,10 @@
 """Correction UI: fix quarantined records without knowing the rules.
 
     streamlit run services/dq-service/src/correction_ui.py
-    streamlit run services/dq-service/src/correction_ui.py -- --output-root data
+    python dq.py ui
+
+Reads and writes the dq tables in PostgreSQL (layout.py); the database
+comes from the POSTGRES_* variables, as for every other step.
 
 Pages
     Fix records    pick a problem in plain words ("Missing email"); accept
@@ -28,7 +31,6 @@ from __future__ import annotations
 
 import argparse
 import getpass
-import json
 import re
 import sys
 from dataclasses import dataclass
@@ -50,9 +52,8 @@ from correction_assist import (
     explain_suggestion,
     field_input,
     lower_label,
-    read_columns,
 )
-from dq_engine import DEFAULT_OUTPUT_ROOT, DEFAULT_RULES
+from dq_engine import DEFAULT_RULES
 from merge import merge_run
 from metrics import export_metrics
 from layout import (
@@ -61,7 +62,6 @@ from layout import (
     data_columns,
     list_runs,
     load_status,
-    read_text_csv,
 )
 from quarantine import (
     DEFAULT_MAX_ATTEMPTS,
@@ -119,14 +119,14 @@ def get_wording(rules: str) -> Wording:
 
 
 @st.cache_resource(show_spinner="Preparing suggestions (first time only)...")
-def get_suggestions(rules: str, valid_file: str, stamp: int) -> Suggestions:
+def get_suggestions(rules: str, layout: Layout, stamp: str) -> Suggestions:
     registry = get_registry(rules)
-    valid = read_columns(Path(valid_file), Suggestions.columns_needed(registry))
-    return Suggestions(registry, valid)
+    columns = [c for c in Suggestions.columns_needed(registry) if c in layout.columns()]
+    return Suggestions(registry, layout.load_valid(columns).drop(columns="record_id"))
 
 
 def ledger_stamp(layout: Layout) -> int:
-    return layout.status_file.stat().st_mtime_ns
+    return layout.ledger_stamp()
 
 
 @st.cache_data(show_spinner=False)
@@ -147,9 +147,7 @@ def read_round(
     actions = registry.severity_actions
     errors["blocking"] = errors["severity"].map(actions).eq("quarantine")
 
-    records = read_text_csv(
-        layout.quarantine_round(round_number) / "quarantine_records.csv"
-    )
+    records = layout.load_quarantine(round_number)
     records = records[records["record_id"].isin(open_ids(status, round_number))]
     return errors, records.set_index("record_id")
 
@@ -162,16 +160,10 @@ def read_repairs(
 
     errors, _ = read_round(layout, round_number, rules, stamp)
     held = set(errors.loc[errors["error_category"].eq("auto_fix_review"), "record_id"])
-    parts = []
-    if held:
-        for path in sorted(layout.quality_round(1).parent.glob("round_*/remediation_audit.csv")):
-            audit = read_text_csv(path)
-            parts.append(audit[audit["record_id"].isin(held)
-                               & audit["outcome"].eq("remediated")])
-    if not parts:
+    if not held:
         return pd.DataFrame(columns=["record_id", "column", "original_value",
                                      "cleaned_value", "action"])
-    return pd.concat(parts, ignore_index=True)
+    return layout.load_audit(record_ids=held, outcome="remediated")
 
 
 def repairs_table(rows: pd.DataFrame) -> pd.DataFrame:
@@ -188,13 +180,13 @@ def repairs_table(rows: pd.DataFrame) -> pd.DataFrame:
 
 @st.cache_data(show_spinner="Looking for values on other records...")
 def suggest_round(
-    layout: Layout, round_number: int, rules: str, stamp: int, valid_stamp: int,
+    layout: Layout, round_number: int, rules: str, stamp: int, valid_stamp: str,
 ) -> tuple[pd.DataFrame, list[str]]:
     """Suggestions for every missing blocking field, and the records whose
     blocking problems can all be solved by them."""
 
     errors, records = read_round(layout, round_number, rules, stamp)
-    suggestions = get_suggestions(rules, str(layout.valid_file), valid_stamp)
+    suggestions = get_suggestions(rules, layout, valid_stamp)
 
     blocking = errors[errors["blocking"]]
     missing = blocking[blocking["error_category"].eq("null") & blocking["column"].notna()]
@@ -654,8 +646,8 @@ def page_fix(ctx: Context) -> None:
 
     stamp = ledger_stamp(layout)
     errors, records = read_round(layout, round_number, str(ctx.args.rules), stamp)
-    valid_stamp = layout.valid_file.stat().st_mtime_ns
-    suggestions = get_suggestions(str(ctx.args.rules), str(layout.valid_file), valid_stamp)
+    valid_stamp = layout.validated_at()
+    suggestions = get_suggestions(str(ctx.args.rules), layout, valid_stamp)
     found, complete = suggest_round(
         layout, round_number, str(ctx.args.rules), stamp, valid_stamp,
     )
@@ -849,8 +841,7 @@ def page_changes(ctx: Context) -> None:
 
 
 def read_publish(layout: Layout) -> dict | None:
-    path = layout.final_file.parent / "merge_result.json"
-    return json.loads(path.read_text(encoding="utf-8")) if path.is_file() else None
+    return layout.load_merge_result()
 
 
 def when(timestamp: str) -> str:
@@ -862,18 +853,12 @@ def when(timestamp: str) -> str:
 def publish(ctx: Context) -> None:
     """Merge into the clean data and refresh the metric tables."""
 
-    try:
-        with st.status("Publishing...", expanded=True) as progress:
-            st.write("Adding the fixed records to the clean data...")
-            summary = merge_run(ctx.layout, published_by=ctx.user)
-            st.write("Updating the quality figures for Power BI...")
-            export_metrics(ctx.args.output_root, ctx.layout.dataset)
-            progress.update(label="Published", state="complete")
-    except PermissionError as error:
-        st.error(f"Could not write **{Path(error.filename).name}**: it is open "
-                 "in another program (often Excel). Close it and press Publish "
-                 "again.")
-        return
+    with st.status("Publishing...", expanded=True) as progress:
+        st.write("Adding the fixed records to the clean data...")
+        summary = merge_run(ctx.layout, published_by=ctx.user)
+        st.write("Updating the quality figures for Power BI...")
+        export_metrics(ctx.layout.dataset)
+        progress.update(label="Published", state="complete")
 
     st.session_state["last_publish"] = summary
     st.rerun()
@@ -948,9 +933,9 @@ def page_progress(ctx: Context) -> None:
         st.markdown("#### What is still to do")
         st.bar_chart(remaining, horizontal=True)
 
-    if layout.correction_log.is_file():
+    log = layout.load_log(latest=200).iloc[::-1]
+    if len(log):
         st.markdown("#### Latest changes")
-        log = read_text_csv(layout.correction_log).tail(200).iloc[::-1]
         st.dataframe(pd.DataFrame({
             "When": [when(t) for t in log["corrected_at"]],
             "Who": log["user"].to_numpy(),
@@ -1106,7 +1091,6 @@ def run_label(run_id: str) -> str:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="DQ correction UI.")
     parser.add_argument("--rules", type=Path, default=DEFAULT_RULES)
-    parser.add_argument("--output-root", type=Path, default=DEFAULT_OUTPUT_ROOT)
     args, _ = parser.parse_known_args(sys.argv[1:])
     return args
 
@@ -1117,7 +1101,7 @@ def main() -> None:
     registry = get_registry(str(args.rules))
     dataset = registry.dataset.get("name", "dataset")
 
-    runs = list_runs(args.output_root, dataset)
+    runs = list_runs(dataset)
     if not runs:
         st.info("There is no checked data yet.")
         return
@@ -1132,7 +1116,7 @@ def main() -> None:
                 1, 20, DEFAULT_MAX_ATTEMPTS,
             )
 
-    layout = Layout(args.output_root, dataset, run_id)
+    layout = Layout(dataset, run_id)
     pending = len(my_changes(layout))
     pages = {
         "Fix records": page_fix,

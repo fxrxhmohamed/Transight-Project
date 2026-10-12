@@ -42,14 +42,13 @@ Usage examples
     python src/profiler.py --null-tokens NULL N/A unknown --delimiter ";" \
         --skip-relationships
 
-    # An ingested file: profile.json goes next to its manifest
+    # An ingestion in the bronze layer: the profile is stored with it
     python src/profiler.py --ingestion ING_20261011_001
 """
 
 from __future__ import annotations
 
 import argparse
-import hashlib
 import json
 import math
 import re
@@ -60,6 +59,11 @@ from typing import Any
 
 import numpy as np
 import pandas as pd
+
+# The bronze layer client lives with the ingestion service (the Docker
+# image copies it next to this file).
+sys.path.append(str(Path(__file__).resolve().parents[2] / "ingestion-service" / "src"))
+import bronze  # noqa: E402
 
 
 # ============================================================
@@ -77,7 +81,6 @@ PROJECT_ROOT = _default_project_root()
 
 DEFAULT_INPUT = PROJECT_ROOT / "data" / "raw" / "banking"
 DEFAULT_OUTPUT = PROJECT_ROOT / "data" / "profiling"
-DEFAULT_RAW_ROOT = PROJECT_ROOT / "data" / "raw"
 DEFAULT_DATASET_NAME = "banking_transactions"
 
 # Text that means "no value". Compared after strip + casefold.
@@ -1609,6 +1612,25 @@ def profile_file(
     print(f"\nProfiling: {file_path}")
 
     df, encoding = read_csv(file_path, delimiter)
+    return profile_frame(
+        df, dataset_name, null_tokens,
+        source_file=file_path.name,
+        source_relative_path=file_path.relative_to(base_dir).as_posix(),
+        encoding=encoding,
+        relationships=relationships,
+    )
+
+
+def profile_frame(
+    df: pd.DataFrame,
+    dataset_name: str,
+    null_tokens: frozenset[str],
+    source_file: str,
+    source_relative_path: str,
+    encoding: str,
+    relationships: bool = True,
+) -> dict[str, Any]:
+    """Profile a table read as text (every column a string column)."""
 
     masks = {
         column: missing_masks(df[column], null_tokens)
@@ -1668,8 +1690,8 @@ def profile_file(
 
     result: dict[str, Any] = {
         "dataset_name": dataset_name,
-        "source_file": file_path.name,
-        "source_relative_path": file_path.relative_to(base_dir).as_posix(),
+        "source_file": source_file,
+        "source_relative_path": source_relative_path,
         "encoding": encoding,
         "row_count": len(df),
         "column_count": len(df.columns),
@@ -1796,75 +1818,35 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--ingestion", default=None,
-        help="Ingestion id (or 'latest') under --raw-root/--dataset-name: "
-        "profiles the ingested copy and writes profile.json next to its "
-        "manifest. Overrides --input and --output.",
-    )
-    parser.add_argument(
-        "--raw-root", type=Path, default=DEFAULT_RAW_ROOT,
-        help="Raw layer root holding <dataset>/<ingestion id>/ folders.",
+        help="Ingestion id (or 'latest') of --dataset-name in the bronze "
+        "layer: profiles its rows and stores the profile with the "
+        "ingestion. Overrides --input and --output.",
     )
 
     return parser.parse_args()
 
 
-def ingestion_folder(raw_root: Path, dataset: str, ingestion_id: str) -> Path:
-    """Folder of an ingestion; 'latest' picks the newest one."""
-
-    dataset_root = raw_root / dataset
-    if ingestion_id == "latest":
-        folders = sorted(
-            folder for folder in dataset_root.glob("ING_*")
-            if (folder / "manifest.json").is_file()
-        )
-        if not folders:
-            raise FileNotFoundError(f"No ingestions under {dataset_root}")
-        return folders[-1]
-
-    folder = dataset_root / ingestion_id
-    if not (folder / "manifest.json").is_file():
-        raise FileNotFoundError(f"No manifest for {ingestion_id} in {dataset_root}")
-    return folder
-
-
 def profile_ingestion(args: argparse.Namespace, null_tokens: frozenset[str]) -> int:
-    """Profile an ingested raw file and register the profile in its manifest."""
+    """Profile an ingestion in bronze and store the profile with it."""
 
-    folder = ingestion_folder(args.raw_root, args.dataset_name, args.ingestion)
-    manifest_path = folder / "manifest.json"
-    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-    stored = folder / manifest["stored_file"]
+    with bronze.connect() as conn:
+        ingestion = bronze.find_ingestion(conn, args.dataset_name, args.ingestion)
+        print(f"\nProfiling: {ingestion['ingestion_id']} "
+              f"({ingestion['source_file']})")
 
-    # The raw layer is immutable: refuse to profile a changed file.
-    digest = hashlib.sha256()
-    with stored.open("rb") as handle:
-        for chunk in iter(lambda: handle.read(1 << 20), b""):
-            digest.update(chunk)
-    if digest.hexdigest() != manifest["sha256"]:
-        print(f"FAILED: {stored} no longer matches its manifest hash.")
-        return 1
+        profile = profile_frame(
+            bronze.read_frame(conn, ingestion),
+            ingestion["dataset"],
+            null_tokens,
+            source_file=ingestion["source_file"],
+            source_relative_path=ingestion["source_path"],
+            encoding=ingestion["encoding"],
+            relationships=not args.skip_relationships,
+        )
+        profile["ingestion_id"] = ingestion["ingestion_id"]
+        bronze.save_profile(conn, ingestion["ingestion_id"], profile)
 
-    profile = profile_file(
-        stored,
-        folder,
-        manifest["dataset"],
-        null_tokens,
-        manifest.get("delimiter", args.delimiter),
-        relationships=not args.skip_relationships,
-    )
-    profile["ingestion_id"] = manifest["ingestion_id"]
-
-    output_path = folder / "profile.json"
-    with output_path.open("w", encoding="utf-8") as output_file:
-        json.dump(profile, output_file, indent=2, ensure_ascii=False,
-                  allow_nan=False)
-
-    manifest["profile"] = output_path.name
-    manifest_path.write_text(
-        json.dumps(manifest, indent=2, ensure_ascii=False), encoding="utf-8",
-    )
-
-    print(f"Created: {output_path}")
+    print(f"Stored: bronze.ingestion.profile of {ingestion['ingestion_id']}")
     return 0
 
 

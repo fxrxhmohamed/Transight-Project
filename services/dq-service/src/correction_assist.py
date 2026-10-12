@@ -25,12 +25,9 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass, field
 from datetime import date
-from pathlib import Path
 from typing import Any
 
 import pandas as pd
-import pyarrow as pa
-import pyarrow.csv as pa_csv
 
 from quarantine import NULL_MARKER
 from registry import Registry, Rule
@@ -339,23 +336,6 @@ class Suggestion:
 def explain_suggestion(source_column: str, source_value: Any, support: int, total: int) -> str:
     return (f"Found on {support} of {total} other records with "
             f"{lower_label(source_column)} {source_value}")
-
-
-def read_columns(path: Path, columns: list[str]) -> pd.DataFrame:
-    """Some columns of a large CSV, as text (keeps leading zeros)."""
-
-    header = pa_csv.open_csv(path).schema.names
-    columns = [c for c in columns if c in header]
-    table = pa_csv.read_csv(
-        path,
-        convert_options=pa_csv.ConvertOptions(
-            include_columns=columns,
-            column_types={c: pa.string() for c in columns},
-            null_values=[""],
-            strings_can_be_null=True,
-        ),
-    )
-    return table.to_pandas(types_mapper={pa.string(): pd.StringDtype()}.get)
 
 
 def dependency_pairs(registry: Registry) -> list[tuple[str, str]]:

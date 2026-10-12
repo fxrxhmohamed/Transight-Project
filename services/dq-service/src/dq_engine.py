@@ -7,15 +7,15 @@ remediates what the rules allow, and splits the records into:
     quarantine  records with an unresolved critical failure, with their
                 cleaned values, and one error line per failed rule
 
-Every record is identified by its record id (from the ingestion
-manifest), so it can be followed through quarantine, correction and
-re-validation (quarantine.py). Every automatic repair is written to a
-remediation audit and a run summary to dq_result.json. See layout.py for
-the folder structure.
+Every record is identified by its record id (from its bronze
+ingestion), so it can be followed through quarantine, correction and
+re-validation (quarantine.py). Every automatic repair is written to the
+remediation audit and a run summary to dq.round_result. Everything is
+stored in PostgreSQL; see layout.py for the tables.
 
 Usage
 -----
-    # An ingested file (see services/ingestion-service)
+    # An ingestion in the bronze layer (see services/ingestion-service)
     python src/dq_engine.py --ingestion ING_20261011_001
     python src/dq_engine.py --ingestion latest
 
@@ -29,8 +29,6 @@ Usage
 from __future__ import annotations
 
 import argparse
-import json
-import shutil
 import sys
 import time
 from dataclasses import dataclass
@@ -50,21 +48,24 @@ from checks import (
     null_tokens,
     whitespace_mask,
 )
+import db
 from layout import (
+    AUDIT_COLUMNS,
+    ERROR_COLUMNS,
     OPEN,
     STATUS_COLUMNS,
     Layout,
     LayoutError,
-    ingestion_folder,
     now_utc,
-    read_manifest,
     record_ids,
     save_status,
-    write_csv,
 )
 from registry import ConfigError, Registry, Rule, load_registry
 from remediation import remediate
 from values import as_flags, canonical_text, parse_values
+
+# The bronze layer client (db.py puts the ingestion service on the path).
+bronze = db.bronze
 
 
 # ============================================================
@@ -81,18 +82,6 @@ def _default_project_root() -> Path:
 PROJECT_ROOT = _default_project_root()
 
 DEFAULT_RULES = PROJECT_ROOT / "config" / "rules" / "quality_rules.yaml"
-DEFAULT_OUTPUT_ROOT = PROJECT_ROOT / "data"
-DEFAULT_RAW_ROOT = PROJECT_ROOT / "data" / "raw"
-
-AUDIT_COLUMNS = [
-    "record_id", "column", "original_value", "cleaned_value",
-    "rule_id", "action", "outcome",
-]
-
-ERROR_COLUMNS = [
-    "record_id", "rule_id", "rule_name", "error_code", "error_category",
-    "dimension", "severity", "column", "value", "message",
-]
 
 
 # ============================================================
@@ -765,8 +754,7 @@ def parse_args() -> argparse.Namespace:
     source = parser.add_mutually_exclusive_group()
     source.add_argument(
         "--ingestion", default="latest",
-        help="Ingestion id under --raw-root/<dataset>, or 'latest' "
-        "(default).",
+        help="Ingestion id in the bronze layer, or 'latest' (default).",
     )
     source.add_argument(
         "--input", type=Path, default=None,
@@ -779,15 +767,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--schema", type=Path, default=None,
         help="Schema registry YAML (default: the one named in the rules).",
-    )
-    parser.add_argument(
-        "--raw-root", type=Path, default=DEFAULT_RAW_ROOT,
-        help="Raw layer root holding <dataset>/<ingestion id>/ folders.",
-    )
-    parser.add_argument(
-        "--output-root", type=Path, default=DEFAULT_OUTPUT_ROOT,
-        help="Folder holding validated/, quarantine/, corrected/ and "
-        "quality/.",
     )
     parser.add_argument(
         "--run-id", default=None,
@@ -812,87 +791,53 @@ def main() -> int:
     source_cfg = dataset.get("source", {})
 
     if args.input:
-        input_path = args.input
+        source = str(args.input)
         run_id = args.run_id or started.strftime("%Y%m%dT%H%M%SZ")
         encoding = source_cfg.get("encoding", "utf-8-sig")
         delimiter = source_cfg.get("delimiter", ",")
         prefix, width = "ROW_", 6
         manifest = None
     else:
-        folder = ingestion_folder(args.raw_root, name, args.ingestion)
-        manifest = read_manifest(folder)
-        input_path = folder / manifest["stored_file"]
+        conn = bronze.connect()
+        manifest = bronze.find_ingestion(conn, name, args.ingestion)
+        source = f"bronze.{manifest['table_name']} ({manifest['source_file']})"
         run_id = manifest["ingestion_id"]
-        encoding = manifest.get("encoding", "utf-8-sig")
-        delimiter = manifest.get("delimiter", ",")
         prefix = manifest["record_id"]["prefix"]
         width = manifest["record_id"]["width"]
 
-    layout = Layout(args.output_root, name, run_id)
+    layout = Layout(name, run_id)
 
-    if layout.status_file.exists():
-        if not args.force:
-            raise ConfigError(
-                f"Run {run_id} is already validated; use --force to start "
-                "over (this removes its quarantine rounds and corrections)."
-            )
-        for path in layout.run_dirs():
-            shutil.rmtree(path, ignore_errors=True)
+    if layout.exists() and not args.force:
+        raise ConfigError(
+            f"Run {run_id} is already validated; use --force to start "
+            "over (this removes its quarantine rounds and corrections)."
+        )
 
-    print(f"Run {run_id}: {input_path}")
+    print(f"Run {run_id}: {source}")
     print(f"Loaded {len(registry.all_rules())} rules.")
 
-    raw = read_source(input_path, encoding, delimiter)
+    if manifest:
+        with conn:
+            frame = bronze.read_frame(conn, manifest)
+        raw = frame.mask(frame.eq(""))
+    else:
+        raw = read_source(args.input, encoding, delimiter)
     drift = check_columns(raw, registry)
     if drift["extra_columns"]:
         print(f"Columns not in the schema (kept, not validated): "
               f"{drift['extra_columns']}")
 
-    if manifest and len(raw) != manifest["row_count"]:
-        raise ConfigError(
-            f"Read {len(raw)} rows but the manifest records "
-            f"{manifest['row_count']}."
-        )
-
     ids = record_ids(prefix, width, len(raw))
     result = validate_frame(raw, registry, ids)
 
     # ---- Outputs ----
-    round_dir = layout.quarantine_round(1)
-    quality_dir = layout.quality_round(1)
     quarantined_ids = result.quarantine["record_id"]
-
-    write_csv(result.valid, layout.valid_file)
-    write_csv(result.quarantine, round_dir / "quarantine_records.csv")
-    write_csv(
-        result.errors[result.errors["record_id"].isin(quarantined_ids)],
-        round_dir / "quarantine_errors.csv",
-    )
-    write_csv(result.audit, quality_dir / "remediation_audit.csv")
-
-    timestamp = now_utc()
-    save_status(layout, pd.DataFrame({
-        "record_id": quarantined_ids.to_numpy(),
-        "status": OPEN,
-        "round": 1,
-        "attempts": 0,
-        "updated_at": timestamp,
-    }, columns=STATUS_COLUMNS))
-
-    outputs = {
-        "valid": layout.valid_file,
-        "quarantine_records": round_dir / "quarantine_records.csv",
-        "quarantine_errors": round_dir / "quarantine_errors.csv",
-        "quarantine_status": layout.status_file,
-        "audit": quality_dir / "remediation_audit.csv",
-        "result": quality_dir / "dq_result.json",
-    }
 
     run = {
         "run_id": run_id,
         "round": 1,
         "dataset": name,
-        "source_file": str(input_path),
+        "source_file": source,
         "ingestion": manifest and {
             "ingestion_id": manifest["ingestion_id"],
             "sha256": manifest["sha256"],
@@ -908,12 +853,38 @@ def main() -> int:
             "rule_count": len(registry.all_rules()),
         },
         "schema_drift": drift,
-        "outputs": {key: str(path) for key, path in outputs.items()},
+        "outputs": {
+            "valid": ".".join(db.record_table_name(name, "valid")),
+            "quarantine_records": ".".join(db.record_table_name(name, "quarantine")),
+            "quarantine_errors": "dq.quarantine_error",
+            "quarantine_status": "dq.quarantine_status",
+            "audit": "dq.remediation_audit",
+            "result": "dq.round_result",
+        },
     }
     summary = summarize(result, run)
 
-    with outputs["result"].open("w", encoding="utf-8") as handle:
-        json.dump(summary, handle, indent=2, ensure_ascii=False, default=str)
+    # One transaction: a run is stored completely or not at all.
+    with db.transaction():
+        layout.delete()
+        layout.start(
+            [c for c in result.valid.columns if c not in ("record_id", "dq_warnings")],
+            source,
+        )
+        layout.save_valid(result.valid)
+        layout.save_quarantine(
+            1, result.quarantine,
+            result.errors[result.errors["record_id"].isin(quarantined_ids)],
+        )
+        layout.save_audit(1, result.audit)
+        save_status(layout, pd.DataFrame({
+            "record_id": quarantined_ids.to_numpy(),
+            "status": OPEN,
+            "round": 1,
+            "attempts": 0,
+            "updated_at": now_utc(),
+        }, columns=STATUS_COLUMNS))
+        layout.save_result(1, summary)
 
     counts = summary["counts"]
     print(
@@ -922,8 +893,8 @@ def main() -> int:
         f"quarantined {counts['quarantined_rows']}, "
         f"duplicates removed {counts['duplicate_rows_removed']}."
     )
-    for key, path in outputs.items():
-        print(f"  {key:<19} {path}")
+    for key, table in summary["outputs"].items():
+        print(f"  {key:<19} {table}")
 
     return 0
 
@@ -931,6 +902,6 @@ def main() -> int:
 if __name__ == "__main__":
     try:
         sys.exit(main())
-    except (ConfigError, LayoutError) as error:
+    except (ConfigError, LayoutError, bronze.BronzeError) as error:
         print(f"Error: {error}", file=sys.stderr)
         sys.exit(2)

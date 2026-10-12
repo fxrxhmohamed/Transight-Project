@@ -37,13 +37,13 @@ Desktop.ini
 tmp/
 temp/
 
-# Data: source files and every pipeline output (raw, validated,
-# quarantine, corrected, quality, final, metrics, profiling) stay local.
+# Data: source files (data/raw/) stay local; pipeline outputs live in
+# PostgreSQL (older versions wrote them under data/ too).
 # Anchored to the project root, so tests/data/ (the CI test dataset) is kept.
 /data/
 
-# Correction files downloaded or exported into the project root
-# (python dq.py export-template --output fixes.csv, UI downloads)
+# Correction templates exported or downloaded into the project root
+# (python dq.py export-template, UI downloads)
 /*.csv
 /*.xlsx
 
@@ -52,7 +52,6 @@ temp/
 
 # Local infrastructure state
 postgres_data/
-kafka_data/
 airflow/logs/
 airflow/airflow.cfg
 airflow/*.pid

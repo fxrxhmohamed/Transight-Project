@@ -4,11 +4,31 @@
 #   http://localhost:8080             Airflow UI (no login: local use only)
 #   docker compose down               stop
 #
-# The project folder is mounted at /opt/metaflow, so the DAGs read and
-# write the same data/ folder as the commands and the correction UI on
-# this machine.
+# The project folder is mounted at /opt/metaflow (code, config, source
+# files). Every step stores its results in the postgres service, which the
+# commands and the correction UI on this machine use too (localhost:5432).
 
 services:
+  # Bronze, dq, silver and metrics schemas. sql/*.sql runs once, on the
+  # first start of an empty volume (the dq-service creates sql/02_dq.sql's
+  # tables itself on older volumes). From this machine: localhost:5432.
+  postgres:
+    image: postgres:17
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-metaflow}
+      POSTGRES_USER: ${POSTGRES_USER:-metaflow}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-change_me_local_only}
+    ports:
+      - "${POSTGRES_PORT:-5432}:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+      - ./sql:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 5s
+      retries: 10
+    restart: unless-stopped
+
   airflow:
     build:
       context: .
@@ -24,11 +44,21 @@ services:
       AIRFLOW__CORE__SIMPLE_AUTH_MANAGER_ALL_ADMINS: "true"
       METAFLOW_HOME: /opt/metaflow
       METAFLOW_PYTHON: /home/airflow/metaflow-venv/bin/python
+      POSTGRES_HOST: postgres
+      POSTGRES_PORT: "5432"
+      POSTGRES_DB: ${POSTGRES_DB:-metaflow}
+      POSTGRES_USER: ${POSTGRES_USER:-metaflow}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-change_me_local_only}
+    depends_on:
+      postgres:
+        condition: service_healthy
     volumes:
       - .:/opt/metaflow
       - airflow-home:/opt/airflow
     restart: unless-stopped
 
 volumes:
+  # All pipeline data: bronze, dq, silver and metrics.
+  postgres-data:
   # Airflow's own database and logs.
   airflow-home:
