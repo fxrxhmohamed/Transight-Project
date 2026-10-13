@@ -92,6 +92,10 @@ services:
     environment:
       <<: *database
       SPARK_DRIVER_MEMORY: ${SPARK_DRIVER_MEMORY:-4g}
+      # An uploaded correction file triggers the dq_apply_corrections DAG
+      # (airflow_trigger.py); the file is saved under data/corrections/.
+      AIRFLOW_API_URL: http://airflow:8080
+      AIRFLOW_UI_URL: http://localhost:8080
     volumes:
       - .:/opt/metaflow
     depends_on:

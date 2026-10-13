@@ -326,7 +326,12 @@ python dq.py ui
   **Publish to clean data** runs the merge and the metrics; fixed records
   reach `silver.<dataset>` only when published (e.g. once a day).
 - **Upload a file**: download the list of problems, fill it in (e.g. in
-  Excel), upload it; it is checked before anything is sent.
+  Excel), upload it; it is checked before anything is sent. With Airflow
+  (Docker), **Send** saves the file under `data/corrections/<run>/` and
+  triggers the `dq_apply_corrections` DAG with it, so it is imported,
+  re-validated and published without anyone starting the DAG by hand; the
+  page shows the state of the run, with a link to it in Airflow. Without
+  `AIRFLOW_API_URL` the UI imports and re-validates the file itself.
 
 The wording and suggestions come from the schema registry
 (`correction_assist.py`), so they follow the dataset without code changes.
@@ -364,7 +369,7 @@ service.
 | DAG | Tasks | When |
 |---|---|---|
 | `dq_ingest_validate` | ingest, profile, validate, merge, metrics, metadata, gold | a new file; param `input` |
-| `dq_apply_corrections` | import-corrections, revalidate, merge, metrics, metadata, gold | a filled-in correction file; params `run`, `file` |
+| `dq_apply_corrections` | import-corrections, revalidate, merge, metrics, metadata, gold | a file sent from the correction UI's upload page (automatic), or by hand; params `run`, `file`, `user`; one run at a time |
 | `dq_publish` | merge, metrics, metadata, gold | every day at 18:00 (records fixed in the UI) |
 
 With Docker (above), Airflow is at http://localhost:8080 and its tasks
@@ -422,6 +427,9 @@ Environment variables (in `.env` or the environment):
 | `SPARK_SHUFFLE_PARTITIONS` | `16` | |
 | `SPARK_DRIVER_HOST` | | address executors use to reach the driver (cluster) |
 | `METAFLOW_JDBC_JAR` | `/opt/jars/postgresql.jar` | PostgreSQL JDBC driver; downloaded from Maven when missing |
+| `AIRFLOW_API_URL` | | correction UI: where it reaches Airflow to trigger `dq_apply_corrections` (Docker: `http://airflow:8080`) |
+| `AIRFLOW_UI_URL` | `AIRFLOW_API_URL` | correction UI: Airflow address for the browser link to a run |
+| `AIRFLOW_USERNAME`, `AIRFLOW_PASSWORD` | | correction UI: Airflow login, when Airflow asks for one |
 
 ## Data quality metrics
 

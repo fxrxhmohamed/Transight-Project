@@ -9,8 +9,12 @@ does in Airflow exactly what the same command does by hand.
                           valid records. Trigger with {"input": "<csv path>"}.
     dq_apply_corrections  import-corrections -> revalidate -> merge -> metrics
                           -> metadata -> gold
-                          A filled-in correction file for a run. Trigger with
-                          {"run": "<ingestion id>", "file": "<csv path>"}.
+                          A filled-in correction file for a run. Triggered by
+                          the correction UI when someone sends an uploaded
+                          file (saved under data/corrections/), or by hand with
+                          {"run": "<ingestion id>", "file": "<csv path>",
+                          "user": "<who corrected>"}. One run at a time, so
+                          two uploads are applied one after the other.
     dq_publish            merge -> metrics -> metadata -> gold, every evening
                           Puts the records fixed in the correction UI that
                           day into the clean data and the gold star schema.
@@ -94,17 +98,28 @@ with DAG(
     start_date=datetime(2026, 1, 1),
     schedule=None,
     catchup=False,
+    # Triggered by the correction UI: a paused DAG would leave its runs queued.
+    is_paused_upon_creation=False,
+    max_active_runs=1,
     default_args=DEFAULT_ARGS,
     params={
         "run": Param("latest", type="string", description="Ingestion id."),
         "file": Param("", type="string",
-                      description="Filled-in correction template (CSV)."),
+                      description="Filled-in correction template (CSV), "
+                                  "relative to METAFLOW_HOME."),
+        "user": Param("airflow", type="string",
+                      description="Who made the corrections (correction log)."),
     },
     tags=["data-quality"],
 ):
     run = '--run "{{ params.run }}"'
+    # The file and the name come from the UI: passed in the environment, not
+    # pasted into the shell command. Not retried: a second import of the same
+    # file would only be refused.
     imported = task("import_corrections", "import-corrections",
-                    f'{run} --file "{{{{ params.file }}}}" --user airflow')
+                    f'{run} --file "$DQ_FILE" --user "$DQ_USER"',
+                    env={"DQ_FILE": "{{ params.file }}", "DQ_USER": "{{ params.user }}"},
+                    append_env=True, retries=0)
     revalidated = task("revalidate", "revalidate", run)
     merged = task("merge", "merge", run)
     measured = task("metrics", "metrics")

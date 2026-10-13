@@ -19,7 +19,10 @@ Pages
                    data" runs the merge (merge.py) and the metric tables
                    (python dq.py metrics)
     Upload a file  download the list of problems, fill it in (e.g. in
-                   Excel), upload it; it is checked before anything is sent
+                   Excel), upload it; it is checked before anything is sent.
+                   With Airflow (AIRFLOW_API_URL, airflow_trigger.py),
+                   sending saves the file under data/corrections/ and
+                   triggers the dq_apply_corrections DAG with it
 
 Nothing is written until "Send" on My changes. Sending calls the same
 functions as "quarantine.py import" and "quarantine.py revalidate", so a
@@ -41,6 +44,7 @@ from pathlib import Path
 import pandas as pd
 import streamlit as st
 
+import airflow_trigger
 from correction_assist import (
     REPAIR_WORDS,
     Change,
@@ -993,6 +997,7 @@ def page_upload(ctx: Context) -> None:
     st.title("Upload a file")
     st.caption("To correct many records at once, e.g. in Excel. Three steps:")
     layout = ctx.layout
+    show_airflow_runs(layout)
     status = read_status(layout, ledger_stamp(layout))
     round_number = current_round(status)
     if round_number is None:
@@ -1081,8 +1086,89 @@ def page_upload(ctx: Context) -> None:
             "Reason": accepted["reason"].to_numpy(),
         }), hide_index=True)
 
+        if not airflow_trigger.enabled():
+            if st.button(f"Send {len(accepted):,} changes", type="primary"):
+                send(ctx, lines, clear_changes=False)
+            return
+
+        st.caption("Sending hands the file to Airflow, which imports it, checks "
+                   "the changed records against all the data and publishes the "
+                   "result. You can follow it below.")
         if st.button(f"Send {len(accepted):,} changes", type="primary"):
-            send(ctx, lines, clear_changes=False)
+            send_to_airflow(ctx, uploaded.getvalue())
+
+
+# ============================================================
+# Uploaded files through Airflow (dq_apply_corrections)
+# ============================================================
+
+CORRECTIONS_DAG = "dq_apply_corrections"
+CORRECTIONS_FOLDER = Path("data") / "corrections"
+
+
+def save_upload(ctx: Context, content: bytes) -> Path:
+    """Keep the uploaded file where Airflow reads it; path relative to ROOT."""
+
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    who = re.sub(r"[^A-Za-z0-9_-]+", "_", ctx.user).strip("_") or "user"
+    relative = CORRECTIONS_FOLDER / ctx.layout.run_id / f"{stamp}_{who}.csv"
+    (ROOT / relative).parent.mkdir(parents=True, exist_ok=True)
+    (ROOT / relative).write_bytes(content)
+    return relative
+
+
+def send_to_airflow(ctx: Context, content: bytes) -> None:
+    """Save the file and trigger dq_apply_corrections with it."""
+
+    relative = save_upload(ctx, content)
+    try:
+        dag_run = airflow_trigger.trigger(CORRECTIONS_DAG, {
+            "run": ctx.layout.run_id,
+            "file": relative.as_posix(),
+            "user": ctx.user,
+        })
+    except airflow_trigger.AirflowError as error:
+        st.error(f"The file could not be handed to Airflow: {error}")
+        return
+    st.session_state["airflow_runs"] = [
+        {"run_id": ctx.layout.run_id, "dag_run": dag_run, "file": relative.as_posix()},
+        *st.session_state.get("airflow_runs", []),
+    ][:5]
+    st.rerun()
+
+
+AIRFLOW_STATES = {
+    "queued": ("Waiting to start", st.info),
+    "running": ("Importing and checking the changes...", st.info),
+    "success": ("Done: the changes are imported, checked and published.", st.success),
+    "failed": ("Failed: ask whoever runs Airflow to look at this run.", st.error),
+}
+
+
+def show_airflow_runs(layout: Layout) -> None:
+    """Uploaded files sent to Airflow from this session, with their state."""
+
+    runs = [r for r in st.session_state.get("airflow_runs", [])
+            if r["run_id"] == layout.run_id]
+    if not runs:
+        return
+    with st.container(border=True):
+        st.markdown("#### Files sent to Airflow")
+        finished = True
+        for sent in runs:
+            try:
+                state = airflow_trigger.run_state(CORRECTIONS_DAG, sent["dag_run"])
+            except airflow_trigger.AirflowError as error:
+                state, text, show = "unknown", f"State unknown: {error}", st.warning
+            else:
+                text, show = AIRFLOW_STATES.get(state, (state, st.info))
+            finished = finished and state in ("success", "failed")
+            link = airflow_trigger.run_link(CORRECTIONS_DAG, sent["dag_run"])
+            show(f"**{Path(sent['file']).name}**: {text}"
+                 + (f" ([open in Airflow]({link}))" if link else ""))
+        if st.button("Refresh", disabled=finished):
+            st.cache_data.clear()
+            st.rerun()
 
 
 # ============================================================
