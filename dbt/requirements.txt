@@ -1,6 +1,0 @@
-# dbt and MetricFlow, installed in their own virtual environment (/opt/dbt in
-# the images): they do not share the pipeline's pinned pandas/numpy.
-dbt-core==1.12.5
-dbt-postgres==1.11.0
-dbt-metricflow==0.15.0
-metricflow==0.213.0

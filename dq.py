@@ -13,12 +13,10 @@ Steps, in pipeline order
     import-corrections  import a filled-in template (--file)
     revalidate          apply the corrections and validate again
     merge               valid + resolved records -> silver.<dataset> (typed)
-    metrics             the DQ metric tables for Power BI (metrics schema;
-                        dbt models tagged dq, every run)
+    metrics             the DQ metric views for Power BI (metrics schema,
+                        every run): apply sql/04_metrics.sql and check them
     metadata            describe silver in the meta schema (metadata engine)
-    gold                build the gold star schema from the metadata (AutoETL),
-                        then the business marts on it (marts schema; dbt
-                        models tagged gold)
+    gold                build the gold star schema from the metadata (AutoETL)
     import-files        load runs kept in data/ by earlier versions into
                         the database (once)
 Helpers
@@ -41,14 +39,10 @@ environment variables (see .env.example). Run it in the pipeline container
     import-corrections,
     revalidate, status  services/dq-service/src/quarantine.py
     merge               services/dq-service/src/merge.py
-    metrics             dbt build --select tag:dq     (dbt/)
+    metrics             services/dq-service/src/metrics.py
     metadata            services/metadata-service/src/metadata.py
-    gold                services/etl-service/src/gold.py, then
-                        dbt build --select tag:gold   (dbt/)
+    gold                services/etl-service/src/gold.py
     import-files        services/dq-service/src/import_files.py
-
-dbt runs from its own virtual environment: DBT names the dbt executable
-(default: dbt on the PATH; the images set /opt/dbt/bin/dbt).
 
 Exit code: the step's own (0 = success).
 
@@ -63,12 +57,9 @@ from __future__ import annotations
 
 import argparse
 import os
-import shutil
 import subprocess
 import sys
-import tempfile
 from pathlib import Path
-from urllib.parse import unquote, urlparse
 
 import yaml
 
@@ -84,10 +75,9 @@ DQ = SERVICES / "dq-service" / "src"
 ENGINE = DQ / "dq_engine.py"
 QUARANTINE = DQ / "quarantine.py"
 MERGE = DQ / "merge.py"
+METRICS = DQ / "metrics.py"
 IMPORT_FILES = DQ / "import_files.py"
 UI = DQ / "correction_ui.py"
-
-DBT_PROJECT = ROOT / "dbt"
 
 DEFAULT_RULES = ROOT / "config" / "rules" / "quality_rules.yaml"
 DEFAULT_DATA = ROOT / "data"
@@ -167,6 +157,9 @@ def command_line(step: str, args: argparse.Namespace) -> list[str]:
     if step == "merge":
         return [str(MERGE), "--run", args.run, "--rules", str(args.rules)]
 
+    if step == "metrics":
+        return [str(METRICS)]
+
     if step in ("metadata", "gold"):
         return [str(METADATA if step == "metadata" else GOLD), "--rules", str(args.rules)]
 
@@ -184,53 +177,8 @@ def run(line: list[str]) -> int:
     return subprocess.run([sys.executable, *line], cwd=ROOT).returncode
 
 
-def dbt_env() -> dict[str, str]:
-    """The environment for dbt: POSTGRES_* taken from METAFLOW_DB_URL when it
-    is set (dbt/profiles.yml reads POSTGRES_* only), and dbt's build output
-    and logs in this machine's temporary folder, not the shared project
-    folder (the containers run as different users)."""
-
-    env = dict(os.environ)
-    scratch = Path(tempfile.gettempdir()) / "metaflow-dbt"
-    env.setdefault("DBT_TARGET_PATH", str(scratch / "target"))
-    env.setdefault("DBT_LOG_PATH", str(scratch / "logs"))
-    url = env.get("METAFLOW_DB_URL")
-    if url:
-        parts = urlparse(url)
-        env.update(
-            POSTGRES_HOST=parts.hostname or "localhost",
-            POSTGRES_PORT=str(parts.port or 5432),
-            POSTGRES_DB=parts.path.lstrip("/") or "metaflow",
-            POSTGRES_USER=unquote(parts.username or ""),
-            POSTGRES_PASSWORD=unquote(parts.password or ""),
-        )
-    return env
-
-
-def run_dbt(select: str) -> int:
-    """dbt build of the models (and their tests) with a tag selector."""
-
-    dbt = os.environ.get("DBT") or shutil.which("dbt") or "dbt"
-    line = ["build", "--select", select,
-            "--project-dir", str(DBT_PROJECT), "--profiles-dir", str(DBT_PROJECT)]
-    print("$ dbt " + " ".join(line[:3]), flush=True)
-    try:
-        return subprocess.run([dbt, *line], cwd=ROOT, env=dbt_env()).returncode
-    except FileNotFoundError:
-        print(f"dbt not found ({dbt}): pip install -r dbt/requirements.txt "
-              "(in its own virtual environment) and set DBT.", file=sys.stderr)
-        return 2
-
-
 def run_step(step: str, args: argparse.Namespace) -> int:
-    """One step: metrics is dbt; gold is gold.py, then the dbt marts."""
-
-    if step == "metrics":
-        return run_dbt("tag:dq")
-    code = run(command_line(step, args))
-    if code == 0 and step == "gold":
-        code = run_dbt("tag:gold")
-    return code
+    return run(command_line(step, args))
 
 
 def run_pipeline(args: argparse.Namespace) -> int:
@@ -306,7 +254,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     revalidate.add_argument("--all", action="store_true")
 
     add("merge", "Merge valid and resolved records into silver.<dataset>.")
-    add("metrics", "Rebuild the DQ metric tables (every run) with dbt.")
+    add("metrics", "Update and check the DQ metric views (every run).")
     add("metadata", "Describe silver in the meta schema.")
     add("gold", "Build the gold star schema from the metadata.")
     add("import-files", "Load runs kept in data/ by earlier versions "

@@ -12,8 +12,8 @@
 --   dq.import_rejection     correction lines that were refused
 --   dq.merge_result         counts and checks of the latest merge of a run
 --
---   metrics.*               the DQ metric tables for Power BI: dbt models
---                           (dbt/models/dq, python dq.py metrics)
+--   metrics.*               the DQ metric views for Power BI
+--                           (sql/04_metrics.sql, python dq.py metrics)
 --
 -- Record tables, one per dataset, are created by the dq-service
 -- (layout.py), one text column per data column like bronze:

@@ -35,6 +35,7 @@ from pyspark.sql import DataFrame, SparkSession
 JDBC_PACKAGE = "org.postgresql:postgresql:42.7.4"
 DEFAULT_JAR = "/opt/jars/postgresql.jar"
 WRITE_BATCH = 10_000
+READ_FETCH = 10_000
 WRITE_PARTITIONS = 8
 
 _session: SparkSession | None = None
@@ -151,7 +152,10 @@ def read(
     (one WHERE condition each)."""
 
     spark = spark or session()
-    options = jdbc_options()
+    # fetchsize: the PostgreSQL driver streams the rows in batches (Spark
+    # turns autocommit off for it); without it, it holds a partition's whole
+    # result in the executor's memory.
+    options = {**jdbc_options(), "fetchsize": str(READ_FETCH)}
     properties = {k: v for k, v in options.items() if k != "url"}
     table = f"({query}) AS q"
     if predicates:

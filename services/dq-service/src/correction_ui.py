@@ -17,7 +17,7 @@ Pages
     My changes     everything you changed; check it and send it
     Progress       what is fixed, removed, still waiting; "Publish to clean
                    data" runs the merge (merge.py) and the metric tables
-                   (python dq.py metrics: dbt)
+                   (python dq.py metrics)
     Upload a file  download the list of problems, fill it in (e.g. in
                    Excel), upload it; it is checked before anything is sent
 
@@ -851,7 +851,7 @@ def when(timestamp: str) -> str:
 
 
 def refresh_metrics() -> None:
-    """Rebuild the metric tables (python dq.py metrics, which runs dbt)."""
+    """Update and check the metric views (python dq.py metrics)."""
 
     done = subprocess.run(
         [sys.executable, str(ROOT / "dq.py"), "metrics"],

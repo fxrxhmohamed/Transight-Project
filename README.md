@@ -16,9 +16,9 @@ trust, lets people correct them (in the browser or with a file), merges
 the result into a clean dataset, describes it and builds a gold star
 schema from that description. Every record keeps one id from ingestion to
 the final dataset. The data work runs on Apache Spark (PySpark), the
-metric tables and business marts are dbt models, and everything is
-stored in PostgreSQL; the only files are the source CSV and the
-correction templates people fill in.
+metric tables are SQL views, and everything is stored in PostgreSQL;
+the only files are the source CSV and the correction templates people
+fill in.
 
 ```
 source CSV
@@ -28,9 +28,9 @@ source CSV
   -> correct      correction UI or a correction file   <- people
   -> revalidate   fixed records resolved, the rest back to quarantine
   -> merge        silver.<dataset> (valid + resolved)
-  -> metrics      metrics.dq_run, dq_rule_result, dq_quarantine, dq_correction (dbt)
+  -> metrics      metrics.dq_run, dq_rule_result, dq_quarantine, dq_correction (views)
   -> metadata     meta.* (what silver holds: entities, keys, relationships)
-  -> gold         gold.fact_* / dim_* star schema, then marts.* (dbt)
+  -> gold         gold.fact_* / dim_* star schema
 ```
 
 ## Project structure
@@ -48,8 +48,9 @@ Transight/
 │
 ├── sql/
 │   ├── 01_bronze.sql            bronze schema (ingestion catalog, append-only)
-│   ├── 02_dq.sql                dq and silver schemas
-│   └── 03_meta_gold.sql         meta and gold schemas
+│   ├── 02_dq.sql                dq, silver and metrics schemas
+│   ├── 03_meta_gold.sql         meta and gold schemas
+│   └── 04_metrics.sql           DQ metric views for Power BI (metrics schema)
 │
 ├── services/
 │   ├── common/src/              shared by every step
@@ -74,13 +75,7 @@ Transight/
 │       ├── db.py                PostgreSQL access (transactions, COPY)
 │       └── import_files.py      load runs kept in data/ by earlier versions
 │
-├── dbt/                         metric tables and the MetricFlow semantic layer
-│   ├── models/dq/               metrics.* from the dq schema (+ DQ metrics)
-│   ├── models/business/         marts.* from gold (+ business metrics)
-│   ├── models/semantic/         time spine for MetricFlow
-│   └── requirements.txt         dbt-core, dbt-postgres, dbt-metricflow
-│
-├── docker/pipeline.Dockerfile   pipeline image: Python 3.12, Java 17, PySpark, dbt
+├── docker/pipeline.Dockerfile   pipeline image: Python 3.12, Java 17, PySpark
 ├── airflow/
 │   ├── Dockerfile               Airflow image with the pipeline's Python
 │   └── dags/data_quality.py     DAGs, one dq.py step per task
@@ -117,14 +112,7 @@ python -m venv .venv
 python -m pip install -r services/ingestion-service/requirements.txt \
                       -r services/metadata-service/requirements.txt \
                       -r services/dq-service/requirements.txt
-
-# dbt and MetricFlow (metrics step) in a virtual environment of their own:
-python -m venv .venv-dbt
-.venv-dbt/bin/pip install -r dbt/requirements.txt   # Windows: .venv-dbt\Scripts\pip
-# then point dq.py at it: DBT=.venv-dbt/bin/dbt (or put it on the PATH)
 ```
-
-The Docker images have both already (`/opt/dbt`, with `DBT` set).
 
 The data is not in the repository. Put the source file at
 `data/raw/banking/banking_transactions.csv`. Ingestion loads it into the
@@ -170,7 +158,7 @@ data column (values as the engine cleaned them):
 | `dq.round_result` | round of a run: its summary (JSON) |
 | `silver.<dataset>` | record of the clean data: valid + resolved, per run |
 | `dq.merge_result` | run: counts and checks of its latest merge |
-| `metrics.*` | dbt models, see [Data quality metrics](#data-quality-metrics) |
+| `metrics.*` | views, see [Data quality metrics](#data-quality-metrics) |
 
 Each step writes its tables in one transaction, so a step that fails
 leaves nothing half written. Older database volumes get any missing
@@ -192,7 +180,6 @@ code per dataset:
 | `gold.fact_<grain entity>` | record of the grain (latest run), with the key of every other entity and `run_id` / `record_id` for lineage |
 | `gold.dim_<entity>` | key of every other entity, from its most recent record |
 | `gold.dim_date` | day the facts cover |
-| `marts.*` | dbt views over gold, see [Business marts](#business-marts) |
 
 Gold is rebuilt and swapped in whole on every run, so Power BI never sees
 a half-built star.
@@ -214,6 +201,7 @@ psql -U postgres -c "CREATE DATABASE metaflow OWNER metaflow"
 psql -U metaflow -d metaflow -f sql/01_bronze.sql
 psql -U metaflow -d metaflow -f sql/02_dq.sql
 psql -U metaflow -d metaflow -f sql/03_meta_gold.sql
+psql -U metaflow -d metaflow -f sql/04_metrics.sql
 ```
 
 The scripts connect with `POSTGRES_HOST`, `POSTGRES_PORT`, `POSTGRES_DB`,
@@ -278,13 +266,13 @@ python dq.py status
 #    one row per record
 python dq.py merge
 
-# 8. Data-quality metric tables for Power BI (metrics schema, all runs; dbt)
+# 8. Data-quality metric views for Power BI (metrics schema, all runs)
 python dq.py metrics
 
 # 9. Describe silver in the meta schema
 python dq.py metadata
 
-# 10. Build the gold star schema from the metadata, then the marts (dbt)
+# 10. Build the gold star schema from the metadata
 python dq.py gold
 
 # Steps 1, 2, 3-4 and 7-10 in one go
@@ -382,10 +370,9 @@ service.
 With Docker (above), Airflow is at http://localhost:8080 and its tasks
 send their Spark jobs to the `spark-master` service. The DAGs use the same
 database as the commands and the UI. The pipeline runs in its own virtual
-environment inside the image, dbt in another (`/opt/dbt`). Elsewhere,
-Airflow workers need `METAFLOW_HOME` (the project folder),
-`METAFLOW_PYTHON` (a Python with the requirements above), `DBT` (the dbt
-executable), Java 17 and the `POSTGRES_*` variables.
+environment inside the image. Elsewhere, Airflow workers need
+`METAFLOW_HOME` (the project folder), `METAFLOW_PYTHON` (a Python with the
+requirements above), Java 17 and the `POSTGRES_*` variables.
 
 ## Tests and CI
 
@@ -401,15 +388,14 @@ python -m pip install pytest
 docker compose up -d postgres     # the tests need PostgreSQL
 python -m pytest tests
 
-# or entirely in Docker (Java and dbt included):
+# or entirely in Docker (Java included):
 docker compose run --rm pipeline python -m pytest tests
 ```
 
 The tests create a temporary database (`metaflow_test_*`) and drop it at
 the end, so the user in `.env` needs `CREATEDB`. GitHub Actions runs the
 same tests, with a PostgreSQL service, on every push and pull request
-(`.github/workflows/data-quality.yml`), after checking the dbt project and
-its semantic layer (`dbt parse`, `mf validate-configs`). `tests/data/build_sample.py`
+(`.github/workflows/data-quality.yml`). `tests/data/build_sample.py`
 rebuilds the dataset from a validated run.
 
 ## Configuration
@@ -436,17 +422,17 @@ Environment variables (in `.env` or the environment):
 | `SPARK_SHUFFLE_PARTITIONS` | `16` | |
 | `SPARK_DRIVER_HOST` | | address executors use to reach the driver (cluster) |
 | `METAFLOW_JDBC_JAR` | `/opt/jars/postgresql.jar` | PostgreSQL JDBC driver; downloaded from Maven when missing |
-| `DBT` | `dbt` on the PATH | dbt executable for the metrics and gold steps |
 
 ## Data quality metrics
 
-The metric tables are dbt models (`dbt/`). `python dq.py metrics` runs
-`dbt build --select tag:dq`: it rebuilds four tables in the `metrics`
-schema for every run, from the `dq` schema, and tests them (each table is
-swapped in whole, so readers never see a half-built one). Connect Power
-BI to them:
+Four views in the `metrics` schema (`sql/04_metrics.sql`) read the `dq`
+schema directly, so they always cover every run. `python dq.py metrics`
+creates them again from that file (so a change there reaches the
+database) and checks them: one row per run and round, one latest round
+per run, quarantined = resolved + discarded + unresolved, known statuses
+and outcomes. Connect Power BI to them:
 
-| Table | One row per |
+| View | One row per |
 |---|---|
 | `dq_run` | run and round: processed, valid, auto-fixed, quarantined, resolved, manually fixed, confirmed after review, discarded, unresolved, DQ scores |
 | `dq_rule_result` | run, round and rule: checked, failed, repaired, unresolved |
@@ -463,41 +449,29 @@ The latest round of a run gives the funnel directly, e.g. 350 with
 issues -> 200 auto-fixed -> 130 manually fixed -> 20 unresolved
 (`is_latest_round` marks it).
 
-### Business marts
+### Business data
 
-`python dq.py gold` builds the gold star schema, then runs `dbt build
---select tag:gold`: views over gold in the `marts` schema
-(`fct_transactions`, `dim_banks`, `dim_branches`, `dim_customers`) and
-`marts.transaction_monthly`, transactions per month, bank, channel, type
-and status (counts, amounts in EGP, channel cost) for Power BI. These
-models are written for the banking_transactions dataset.
+Power BI reads the gold star schema directly: `gold.fact_transaction`,
+`gold.dim_bank`, `gold.dim_branch`, `gold.dim_customer`,
+`gold.dim_account` and `gold.dim_date` (see `sql/03_meta_gold.sql`).
+`python dq.py gold` replaces them in one transaction, so a refresh never
+sees a half-built star; their columns follow the metadata.
 
-### Semantic layer (MetricFlow)
+### Metric definitions
 
-The metrics themselves are defined once, in dbt's semantic layer
-(`dbt/models/dq/_dq_semantic.yml`, `dbt/models/business/_business.yml`):
+The semantic layer is the Power BI semantic model: relationships and DAX
+measures over the views and gold tables above. Define the measures as
+follows, ratios as sum / sum (never an average of a ratio column):
 
 | Metric | Definition |
 |---|---|
-| `dq_initial_score`, `dq_final_score` | valid / processed, (valid + resolved) / processed |
-| `dq_auto_fix_rate`, `dq_resolution_rate` | auto-fixed / records with issues, resolved / quarantined |
-| `dq_rule_failure_rate`, `dq_rule_repair_rate` | failed / checked, repaired / failed (per rule, dimension, severity) |
-| `dq_corrections`, `dq_manual_corrections`, ... | counts of the record funnel and the corrections |
-| `transactions`, `transaction_amount_egp`, `average_transaction_egp` | count, sum and average of the transactions |
-| `failure_rate`, `digital_share`, `cost_per_transaction_egp` | failed / all, digital channel / all, channel cost / transaction |
-| `active_customers`, `digital_migration_opportunities` | distinct customers, flagged transactions |
+| DQ initial score, DQ final score | valid / processed, (valid + resolved) / processed |
+| DQ auto-fix rate, DQ resolution rate | auto-fixed / records with issues, resolved / quarantined |
+| Rule failure rate, rule repair rate | failed / checked, repaired / failed (per rule, dimension, severity) |
+| Record funnel and corrections | counts of `dq_run` and `dq_correction` |
+| Transactions, amount (EGP), average transaction (EGP) | count, sum and average of the transactions |
+| Failure rate, digital share, cost per transaction (EGP) | failed / all, digital channel / all, channel cost / transaction |
+| Active customers, digital migration opportunities | distinct customers, flagged transactions |
 
-Query them with MetricFlow, from `dbt/` (in the pipeline container:
-`docker compose run --rm -w /opt/metaflow/dbt pipeline mf query ...`):
-
-```bash
-dbt parse --profiles-dir .     # once, and after changing the YAML: writes target/
-mf query --metrics dq_initial_score,dq_final_score --group-by run_round__run_id
-mf query --metrics dq_rule_failure_rate --group-by rule_result__dimension
-mf query --metrics transactions,failure_rate --group-by metric_time__month,bank__bank_name
-mf query --metrics active_customers --group-by customer__customer_segment
-mf list metrics
-```
-
-Power BI reads the tables above; the semantic layer API for BI tools is
-part of dbt Cloud only.
+The run-level DQ measures read the latest round of each run only
+(`dq_run[is_latest_round] = TRUE`).

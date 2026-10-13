@@ -63,8 +63,3 @@ airflow/simple_auth_manager_passwords.json.generated
 *.sqlite
 *.sqlite3
 
-# dbt build output
-dbt/target/
-dbt/logs/
-dbt/dbt_packages/
-dbt/.user.yml
