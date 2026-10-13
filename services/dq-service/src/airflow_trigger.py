@@ -93,6 +93,19 @@ def trigger(dag_id: str, conf: dict) -> str:
     return answer["dag_run_id"]
 
 
+def active_runs(dag_ids: list[str]) -> list[str]:
+    """The DAGs among these with a run queued or running."""
+
+    token = _token()
+    busy = []
+    for dag_id in dag_ids:
+        answer = _call("GET", f"/api/v2/dags/{dag_id}/dagRuns"
+                       "?state=queued&state=running&limit=1", token=token)
+        if answer.get("total_entries") or answer.get("dag_runs"):
+            busy.append(dag_id)
+    return busy
+
+
 def run_state(dag_id: str, run_id: str) -> str:
     """queued, running, success or failed."""
 

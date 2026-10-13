@@ -6,7 +6,10 @@ does in Airflow exactly what the same command does by hand.
     dq_ingest_validate    ingest -> profile -> validate -> merge -> metrics
                           -> metadata -> gold
                           A new source file: land it, check it, publish the
-                          valid records. Trigger with {"input": "<csv path>"}.
+                          valid records (incremental load into silver).
+                          Triggered by the correction UI ("Load new data",
+                          files saved under data/raw/uploads/), or by hand
+                          with {"input": "<csv path>"}. One run at a time.
     dq_apply_corrections  import-corrections -> revalidate -> merge -> metrics
                           -> metadata -> gold
                           A filled-in correction file for a run. Triggered by
@@ -18,6 +21,9 @@ does in Airflow exactly what the same command does by hand.
     dq_publish            merge -> metrics -> metadata -> gold, every evening
                           Puts the records fixed in the correction UI that
                           day into the clean data and the gold star schema.
+                          Also triggered by "Publish to clean data" in the
+                          correction UI with {"run": "<ingestion id>",
+                          "user": "<who published>"}. One run at a time.
 
 The data work of the steps runs on Spark: the tasks submit their jobs to
 the cluster named by SPARK_MASTER (docker-compose.yml). metrics updates
@@ -76,12 +82,22 @@ with DAG(
     start_date=datetime(2026, 1, 1),
     schedule=None,
     catchup=False,
+    # Triggered by the correction UI: a paused DAG would leave its runs
+    # queued. One file at a time, loaded in the order they were sent.
+    is_paused_upon_creation=False,
+    max_active_runs=1,
     default_args=DEFAULT_ARGS,
     params={"input": Param("data/raw/banking/banking_transactions.csv", type="string",
                            description="Source CSV, relative to METAFLOW_HOME.")},
     tags=["data-quality"],
 ):
-    ingest = task("ingest", "ingest", '--input "{{ params.input }}"', do_xcom_push=True)
+    # A file already in bronze exits with 99: BashOperator's skip code, so
+    # the task and the rest of the run are skipped (nothing new to load).
+    # The path may come from the UI: passed in the environment, not pasted
+    # into the shell command.
+    ingest = task("ingest", "ingest", '--input "$DQ_INPUT"', do_xcom_push=True,
+                  skip_on_exit_code=99, env={"DQ_INPUT": "{{ params.input }}"},
+                  append_env=True)
     profile = task("profile", "profile", f"--run {INGESTED}")
     validate = task("validate", "validate", f"--run {INGESTED}")
     merge = task("merge", "merge", f"--run {INGESTED}")
@@ -135,10 +151,21 @@ with DAG(
     start_date=datetime(2026, 1, 1),
     schedule="0 18 * * *",
     catchup=False,
+    # Triggered by the correction UI too: a paused DAG would leave its runs
+    # queued.
+    is_paused_upon_creation=False,
+    max_active_runs=1,
     default_args=DEFAULT_ARGS,
+    params={
+        "run": Param("latest", type="string", description="Ingestion id."),
+        "user": Param("", type="string",
+                      description="Who published (empty: the evening schedule)."),
+    },
     tags=["data-quality"],
 ):
-    (
-        task("merge", "merge", "--run latest") >> task("metrics", "metrics")
-        >> task("metadata", "metadata") >> task("gold", "gold")
-    )
+    # Run and name come from the UI: passed in the environment, not pasted
+    # into the shell command.
+    merged = task("merge", "merge", '--run "$DQ_RUN" --published-by "$DQ_USER"',
+                  env={"DQ_RUN": "{{ params.run }}", "DQ_USER": "{{ params.user }}"},
+                  append_env=True)
+    merged >> task("metrics", "metrics") >> task("metadata", "metadata") >> task("gold", "gold")

@@ -42,7 +42,7 @@ from registry import ConfigError, Registry, load_registry  # noqa: E402
 DEFAULT_RULES = ROOT / "config" / "rules" / "quality_rules.yaml"
 
 # Silver columns that are not data.
-SYSTEM_COLUMNS = ("run_id", "record_id", "dq_warnings")
+SYSTEM_COLUMNS = ("run_id", "record_id", "dq_warnings", "loaded_at")
 
 
 def quote(name: str) -> str:

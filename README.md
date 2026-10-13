@@ -243,7 +243,8 @@ Docker, put `docker compose run --rm pipeline` in front of each command
 
 ```bash
 # 1. Ingest: load into bronze with an ingestion id and record ids
-#    (the last output line is the new ingestion id)
+#    (the last output line is the new ingestion id); a file already in
+#    bronze (same SHA-256) is skipped with exit code 99 (--force loads it)
 python dq.py ingest --input data/raw/banking/banking_transactions.csv
 
 # 2. Profile the ingestion (stored in bronze.ingestion.profile)
@@ -263,7 +264,7 @@ python dq.py revalidate
 python dq.py status
 
 # 7. Merge into the clean dataset (silver.<dataset>): valid + resolved,
-#    one row per record
+#    upserted by primary key (initial or incremental load, see below)
 python dq.py merge
 
 # 8. Data-quality metric views for Power BI (metrics schema, all runs)
@@ -283,6 +284,34 @@ Every step works on the latest ingestion unless given `--run <ingestion
 id>`, and takes `--rules` to use another rules file. `validate --force`
 starts a run over (it removes that run's quarantine rounds, corrections
 and clean data).
+
+### Initial and incremental loads
+
+Silver holds one row per primary key (`primary_key` in
+`config/metadata/schema_registry.yaml`, `transaction_id`). The first merge
+into an empty silver is the **initial load**. Every later file is an
+**incremental load**: it may hold new transactions and new versions of
+existing ones, and merging it
+
+- inserts the keys silver does not have,
+- updates the keys whose values changed (the row then points to the new
+  run and record),
+- leaves the keys with the same values as they are (their lineage stays
+  with the run that loaded them),
+- never replaces the version of a newer run (merging an older run again
+  is safe), and changes nothing when the same run is merged again.
+
+A file already in bronze is not ingested again. Every merge is logged in
+`dq.load_log` (mode, rows staged / inserted / updated / unchanged / older /
+removed, silver rows before and after); the counts must add up or the
+load is rolled back. A silver table made by an earlier version (one row
+per run and record) is converted on the first merge: the newest version
+of each key is kept and the old table stays as
+`silver.<dataset>_by_run`.
+
+`tests/test_incremental_load.py` loads an initial and an incremental file
+and checks the counts, that no key is duplicated or lost, lineage back to
+bronze, a file loaded twice, runs merged again and gold against silver.
 
 ### Correction file
 

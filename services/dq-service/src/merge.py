@@ -6,9 +6,18 @@ id and a resolved row replaces any earlier version of the same record, so
 each record appears once. Records still open, waiting for manual review or
 discarded are left out.
 
-    silver.<dataset>    the clean data, typed: one row per record (the
-                        run's rows are replaced on every merge)
+    silver.<dataset>    the clean data, typed: one row per primary key
+                        (schema registry), the newest run's version
     dq.merge_result     counts and checks of the run's latest merge
+    dq.load_log         every load into silver and its counts
+
+Loading is incremental: the run's records are staged and upserted into
+silver by primary key (layout.load_into_silver). The first load into an
+empty silver is the initial load; every later one inserts new keys,
+updates the keys whose values changed and leaves the others as they are.
+A run never overwrites the version of a newer run, and merging a run again
+changes nothing unless its records did. Records without a key value are
+left out; when a run holds a key twice, its last record is loaded.
 
 Silver columns get the type of the schema registry: integer -> bigint,
 decimal -> numeric, boolean -> boolean, date -> date, time -> time, other
@@ -86,8 +95,14 @@ def typed_value(registry: Registry, column: str) -> str:
     return ident(column)
 
 
+def primary_key(registry: Registry) -> list[str]:
+    """Silver's key: the registry's primary key, or the record id."""
+
+    return list(registry.dataset.get("primary_key") or []) or ["record_id"]
+
+
 def merge_run(layout: Layout, registry: Registry, published_by: str | None = None) -> dict:
-    """Replace the run's rows in silver.<dataset>; return the merge summary."""
+    """Load the run's records into silver.<dataset>; return the merge summary."""
 
     columns = layout.columns()
     valid = layout.spark_records("valid").persist(StorageLevel.MEMORY_AND_DISK)
@@ -150,7 +165,24 @@ def merge_run(layout: Layout, registry: Registry, published_by: str | None = Non
         for c in checked
     ]).collect()[0].asDict() if checked else {}
 
-    spark_io.write(typed, layout.prepare_silver(types))
+    # One row per key: none without a key value, the run's last record of a
+    # key it holds twice.
+    key = primary_key(registry)
+    present = " AND ".join(f"{ident(k)} IS NOT NULL" for k in key)
+    keyed = typed.filter(present).persist(StorageLevel.MEMORY_AND_DISK)
+    last = Window.partitionBy(*key).orderBy(F.col("record_id").desc())
+    loaded = (keyed.withColumn("__n", F.row_number().over(last))
+              .filter(F.col("__n") == 1).drop("__n"))
+    no_key = final_rows - keyed.count()
+    same_key = keyed.count() - loaded.count()
+
+    stage = layout.prepare_silver(types, key)
+    try:
+        spark_io.write(loaded, stage)
+        load = layout.load_into_silver(stage, key)
+    finally:
+        layout.drop_stage(stage)
+        keyed.unpersist()
 
     status = {r["status"]: r["n"] for r in spark_io.read(
         "SELECT status, count(*) AS n FROM dq.quarantine_status "
@@ -177,7 +209,10 @@ def merge_run(layout: Layout, registry: Registry, published_by: str | None = Non
             "left_out_open": int(status.get("OPEN", 0)),
             "left_out_manual_review": int(status.get("MANUAL_REVIEW_REQUIRED", 0)),
             "left_out_discarded": int(status.get("DISCARDED", 0)),
+            "left_out_no_key": no_key,
+            "same_key_in_run": same_key,
         },
+        "load": load,
         "resolved_by_round": by_round,
         "checks": {
             "rows_equal_valid_plus_resolved": final_rows == valid_rows + resolved_rows,
@@ -199,6 +234,8 @@ def parse_args() -> argparse.Namespace:
                         help="Run (ingestion) id, or 'latest' (default).")
     parser.add_argument("--rules", type=Path, default=DEFAULT_RULES)
     parser.add_argument("--schema", type=Path, default=None)
+    parser.add_argument("--published-by", default="",
+                        help="Who published (kept in dq.merge_result).")
     return parser.parse_args()
 
 
@@ -208,7 +245,7 @@ def main() -> int:
     dataset = registry.dataset.get("name", "dataset")
     run_id = latest_run(dataset) if args.run == "latest" else args.run
 
-    summary = merge_run(Layout(dataset, run_id), registry)
+    summary = merge_run(Layout(dataset, run_id), registry, args.published_by or None)
     counts = summary["counts"]
 
     print(f"Run {run_id}: {counts['final_rows']} rows = valid "
@@ -221,6 +258,14 @@ def main() -> int:
     if summary["type_conversion_nulls"]:
         print(f"  values that did not convert to their type (stored as null): "
               f"{summary['type_conversion_nulls']}")
+    load = summary["load"]
+    print(f"  {load['mode']} load: {load['inserted']} inserted, {load['updated']} "
+          f"updated, {load['unchanged']} unchanged, {load['older']} older than "
+          f"silver, {load['removed']} removed; silver {load['silver_rows_before']} "
+          f"-> {load['silver_rows_after']} rows")
+    if counts["left_out_no_key"] or counts["same_key_in_run"]:
+        print(f"  not loaded: {counts['left_out_no_key']} without a key, "
+              f"{counts['same_key_in_run']} earlier records of a key the run holds twice")
     print(f"  clean  {summary['outputs']['clean']}")
     return 0
 

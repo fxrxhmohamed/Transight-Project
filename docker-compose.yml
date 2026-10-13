@@ -87,6 +87,7 @@ services:
     command: >
       python -m streamlit run services/dq-service/src/correction_ui.py
       --server.address 0.0.0.0 --server.port 8501 --server.headless true
+      --server.maxUploadSize 2048
     ports:
       - "${UI_PORT:-8501}:8501"
     environment:

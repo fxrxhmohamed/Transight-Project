@@ -5,7 +5,8 @@
 Steps, in pipeline order
     ingest              load a source file into the bronze layer (PostgreSQL);
                         prints the new ingestion id as the last line
-                        (Airflow XCom)
+                        (Airflow XCom); exit code 99 when the file is
+                        already in bronze (--force loads it again)
     profile             profile an ingestion (stored with it in bronze)
     validate            validate an ingestion: valid records, quarantine,
                         remediation audit
@@ -81,6 +82,8 @@ UI = DQ / "correction_ui.py"
 
 DEFAULT_RULES = ROOT / "config" / "rules" / "quality_rules.yaml"
 DEFAULT_DATA = ROOT / "data"
+# ingest.py: the file is already in bronze (nothing loaded).
+ALREADY_INGESTED_EXIT = 99
 
 
 def load_env(path: Path) -> None:
@@ -121,7 +124,7 @@ def command_line(step: str, args: argparse.Namespace) -> list[str]:
         line = [str(INGEST), "--dataset", dataset_name(args.rules)]
         if args.input:
             line += ["--input", str(args.input)]
-        return line
+        return line + (["--force"] if getattr(args, "force", False) else [])
 
     if step == "profile":
         return [str(PROFILER), "--ingestion", args.run,
@@ -155,7 +158,9 @@ def command_line(step: str, args: argparse.Namespace) -> list[str]:
         return quarantine(args, "status")
 
     if step == "merge":
-        return [str(MERGE), "--run", args.run, "--rules", str(args.rules)]
+        line = [str(MERGE), "--run", args.run, "--rules", str(args.rules)]
+        published_by = getattr(args, "published_by", None)
+        return line + (["--published-by", published_by] if published_by else [])
 
     if step == "metrics":
         return [str(METRICS)]
@@ -193,6 +198,9 @@ def run_pipeline(args: argparse.Namespace) -> int:
     ) as process:
         for line in process.stdout:
             print(line, end="", flush=True)
+    if process.returncode == ALREADY_INGESTED_EXIT:
+        print("Nothing new to load.")
+        return 0
     if process.returncode:
         return process.returncode
 
@@ -228,10 +236,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         ("ingest", "Load a source file into bronze."),
         ("pipeline", "Ingest, profile, validate, merge, metrics, metadata and gold."),
     ):
-        add(name, help_text).add_argument(
-            "--input", type=Path, default=None,
-            help="Source CSV (default: the ingestion service's).",
-        )
+        step = add(name, help_text)
+        step.add_argument("--input", type=Path, default=None,
+                          help="Source CSV (default: the ingestion service's).")
+        step.add_argument("--force", action="store_true",
+                          help="Load the file even when it is already in bronze.")
 
     add("profile", "Profile an ingestion.")
 
@@ -253,7 +262,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     revalidate.add_argument("--max-attempts", type=int, default=3)
     revalidate.add_argument("--all", action="store_true")
 
-    add("merge", "Merge valid and resolved records into silver.<dataset>.")
+    add("merge", "Merge valid and resolved records into silver.<dataset>.").add_argument(
+        "--published-by", default=None, help="Who published (kept with the merge).")
     add("metrics", "Update and check the DQ metric views (every run).")
     add("metadata", "Describe silver in the meta schema.")
     add("gold", "Build the gold star schema from the metadata.")

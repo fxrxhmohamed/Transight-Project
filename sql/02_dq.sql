@@ -11,6 +11,8 @@
 --   dq.correction_log       every manual correction ever imported
 --   dq.import_rejection     correction lines that were refused
 --   dq.merge_result         counts and checks of the latest merge of a run
+--   dq.load_log             every load into silver: initial or incremental,
+--                           rows inserted / updated / unchanged
 --
 --   metrics.*               the DQ metric views for Power BI
 --                           (sql/04_metrics.sql, python dq.py metrics)
@@ -21,7 +23,8 @@
 --   dq.<dataset>_valid       records that passed the first validation
 --   dq.<dataset>_quarantine  records open in each round (cleaned values)
 --   dq.<dataset>_resolved    records that passed re-validation, per round
---   silver.<dataset>         clean data: valid + resolved, one row per record
+--   silver.<dataset>         clean data: valid + resolved, one row per
+--                            primary key (the newest run's version)
 --
 -- Docker runs this file once, when the database volume is first created;
 -- the dq-service also applies it when the dq schema is missing.
@@ -179,3 +182,32 @@ CREATE TABLE IF NOT EXISTS dq.merge_result (
     PRIMARY KEY (dataset, run_id),
     FOREIGN KEY (dataset, run_id) REFERENCES dq.run ON DELETE CASCADE
 );
+
+-- ---- Loads into silver -------------------------------------------------
+--
+-- One row per merge. initial: silver was empty; incremental: it was not.
+-- Every staged row is inserted, updated, unchanged (same values already
+-- in silver) or older (silver holds a newer run's version), so
+--   staged = inserted + updated + unchanged + older
+--   silver_rows_after = silver_rows_before + inserted - removed
+-- (removed: rows of the run a new merge of it no longer holds).
+
+CREATE TABLE IF NOT EXISTS dq.load_log (
+    load_id             bigint      GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    dataset             text        NOT NULL,
+    run_id              text        NOT NULL,
+    mode                text        NOT NULL CHECK (mode IN ('initial', 'incremental')),
+    staged              bigint      NOT NULL,
+    inserted            bigint      NOT NULL,
+    updated             bigint      NOT NULL,
+    unchanged           bigint      NOT NULL,
+    older               bigint      NOT NULL,
+    removed             bigint      NOT NULL,
+    silver_rows_before  bigint      NOT NULL,
+    silver_rows_after   bigint      NOT NULL,
+    loaded_at           timestamptz NOT NULL DEFAULT now(),
+    CHECK (staged = inserted + updated + unchanged + older),
+    CHECK (silver_rows_after = silver_rows_before + inserted - removed)
+);
+
+CREATE INDEX IF NOT EXISTS load_log_run_idx ON dq.load_log (dataset, run_id);

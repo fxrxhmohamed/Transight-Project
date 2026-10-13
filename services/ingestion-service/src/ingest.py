@@ -12,6 +12,12 @@ not at all:
     bronze.<dataset>    every data row, one column per source column,
                         values exactly as read
 
+A file whose content (SHA-256) is already in bronze for the dataset is
+not loaded again: ingest stops with exit code 99 (Airflow marks the task,
+and so the rest of the run, skipped) unless --force is given. A new file
+holding new and changed records is an incremental load: merge.py upserts
+it into silver by primary key.
+
 Bronze is append-only. Later steps read an ingestion from it and
 identify every row by its record id:
 
@@ -28,6 +34,9 @@ Usage
 
     # Another file or dataset
     python src/ingest.py --input landing/sales.csv --dataset sales
+
+    # The same file again, on purpose
+    python src/ingest.py --force
 """
 
 from __future__ import annotations
@@ -66,6 +75,14 @@ HASH_CHUNK = 1 << 20
 # Extra columns read past the header: a row that fills one has more fields
 # than the header and stops the ingestion.
 OVERFLOW_COLUMNS = 3
+# Exit code of a file already ingested (Airflow's BashOperator: skipped).
+ALREADY_INGESTED_EXIT = 99
+
+
+class AlreadyIngested(Exception):
+    def __init__(self, ingestion_id: str) -> None:
+        super().__init__(ingestion_id)
+        self.ingestion_id = ingestion_id
 
 
 def sha256_of(path: Path) -> str:
@@ -123,16 +140,38 @@ def read_rows(source: Path, columns: list[str], encoding: str, delimiter: str):
     ])
 
 
+def ingested_as(dataset: str, sha256: str) -> str | None:
+    """The first ingestion of the dataset with this file content, if any."""
+
+    with bronze.connect() as conn:
+        row = conn.execute(
+            "SELECT ingestion_id FROM bronze.ingestion "
+            "WHERE dataset = %s AND sha256 = %s ORDER BY ingestion_id LIMIT 1",
+            (dataset, sha256),
+        ).fetchone()
+    return row[0] if row else None
+
+
 def ingest(
     source: Path,
     dataset: str,
     encoding: str = "utf-8-sig",
     delimiter: str = ",",
+    force: bool = False,
 ) -> dict[str, Any]:
-    """Load the source into bronze; returns the ingestion record."""
+    """Load the source into bronze; returns the ingestion record.
+
+    Raises AlreadyIngested when the same content is already in bronze
+    (unless force).
+    """
 
     if not source.is_file():
         raise FileNotFoundError(f"Input not found: {source}")
+
+    sha256 = sha256_of(source)
+    previous = None if force else ingested_as(dataset, sha256)
+    if previous:
+        raise AlreadyIngested(previous)
 
     started = datetime.now(timezone.utc)
     columns = read_header(source, encoding, delimiter)
@@ -147,7 +186,7 @@ def ingest(
             spark_io.write(rows, bronze.create_stage(conn, stage, columns))
             return bronze.store_staged(
                 conn, stage, source, relative_to_root(source), dataset,
-                sha256_of(source), columns, row_count, encoding, delimiter, started,
+                sha256, columns, row_count, encoding, delimiter, started,
             )
         finally:
             bronze.drop_stage(conn, stage)
@@ -165,6 +204,9 @@ def parse_args() -> argparse.Namespace:
                         help="Dataset name.")
     parser.add_argument("--encoding", default="utf-8-sig")
     parser.add_argument("--delimiter", default=",")
+    parser.add_argument("--force", action="store_true",
+                        help="Load the file even when the same content is "
+                        "already in bronze.")
     return parser.parse_args()
 
 
@@ -173,7 +215,12 @@ def main() -> int:
     try:
         manifest = ingest(
             args.input.resolve(), args.dataset, args.encoding, args.delimiter,
+            args.force,
         )
+    except AlreadyIngested as error:
+        print(f"{args.input} is already in bronze as {error.ingestion_id} "
+              "(same SHA-256); nothing loaded. Use --force to load it again.")
+        return ALREADY_INGESTED_EXIT
     finally:
         spark_io.stop()
 

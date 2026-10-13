@@ -16,13 +16,22 @@ Pages
                    to accept (ACCEPT), correct or remove
     My changes     everything you changed; check it and send it
     Progress       what is fixed, removed, still waiting; "Publish to clean
-                   data" runs the merge (merge.py) and the metric tables
-                   (python dq.py metrics)
+                   data" triggers the dq_publish DAG with Airflow (merge,
+                   metrics, metadata, gold; the UI runs no Spark for it and
+                   the button waits while a load, correction file or
+                   publish is running). Without Airflow it runs the merge
+                   (merge.py) and the metric tables (python dq.py metrics)
+                   here
     Upload a file  download the list of problems, fill it in (e.g. in
                    Excel), upload it; it is checked before anything is sent.
                    With Airflow (AIRFLOW_API_URL, airflow_trigger.py),
                    sending saves the file under data/corrections/ and
                    triggers the dq_apply_corrections DAG with it
+    Load new data  upload a new source file (CSV); it is saved under
+                   data/raw/uploads/ and triggers the dq_ingest_validate DAG
+                   (ingest, validate, incremental load into silver, gold).
+                   A file already loaded (same SHA-256) is refused. Shown
+                   even before any data is loaded (the initial load)
 
 Nothing is written until "Send" on My changes. Sending calls the same
 functions as "quarantine.py import" and "quarantine.py revalidate", so a
@@ -33,7 +42,10 @@ results. Wording and suggestions come from correction_assist.py.
 from __future__ import annotations
 
 import argparse
+import csv
 import getpass
+import hashlib
+import io
 import re
 import subprocess
 import sys
@@ -45,6 +57,7 @@ import pandas as pd
 import streamlit as st
 
 import airflow_trigger
+import db
 from correction_assist import (
     REPAIR_WORDS,
     Change,
@@ -866,8 +879,52 @@ def refresh_metrics() -> None:
                            + (done.stdout + done.stderr)[-2000:])
 
 
+PUBLISH_DAG = "dq_publish"
+PUBLISH_STATES = {
+    "queued": ("Waiting to start", st.info),
+    "running": ("Publishing: clean data, quality figures and Power BI tables...",
+                st.info),
+    "success": ("Published: the clean data, quality figures and Power BI "
+                "tables are up to date.", st.success),
+    "failed": ("Failed: ask whoever runs Airflow to look at this run.", st.error),
+}
+# What a running DAG is doing, in plain words (Publish waits for them).
+BUSY_WORDS = {
+    "dq_ingest_validate": "a new data file is being loaded",
+    "dq_apply_corrections": "an uploaded correction file is being applied",
+    "dq_publish": "a publish is already running",
+}
+
+
+def busy_with() -> list[str]:
+    """What Airflow is running now that Publish must wait for."""
+
+    try:
+        return [BUSY_WORDS[d] for d in airflow_trigger.active_runs(list(BUSY_WORDS))]
+    except airflow_trigger.AirflowError:
+        return []
+
+
+def publish_with_airflow(ctx: Context) -> None:
+    """Trigger dq_publish for the run (merge, metrics, metadata, gold)."""
+
+    try:
+        dag_run = airflow_trigger.trigger(PUBLISH_DAG, {
+            "run": ctx.layout.run_id, "user": ctx.user,
+        })
+    except airflow_trigger.AirflowError as error:
+        st.error(f"Publishing could not be handed to Airflow: {error}")
+        return
+    st.session_state["publish_runs"] = [
+        {"run_id": ctx.layout.run_id, "dag_run": dag_run,
+         "file": f"Publish of {run_label(ctx.layout.run_id)}"},
+        *st.session_state.get("publish_runs", []),
+    ][:5]
+    st.rerun()
+
+
 def publish(ctx: Context) -> None:
-    """Merge into the clean data and refresh the metric tables."""
+    """Merge into the clean data and refresh the metric tables (no Airflow)."""
 
     with st.status("Publishing...", expanded=True) as progress:
         st.write("Adding the fixed records to the clean data...")
@@ -907,8 +964,20 @@ def publish_section(ctx: Context, fixed: int) -> None:
 
     label = ("Publish to clean data" if waiting > 0 or not last
              else "Publish again (nothing new)")
-    if st.button(label, type="primary" if waiting > 0 else "secondary"):
-        publish(ctx)
+    if not airflow_trigger.enabled():
+        if st.button(label, type="primary" if waiting > 0 else "secondary"):
+            publish(ctx)
+        return
+
+    show_dag_runs(PUBLISH_DAG, [r for r in st.session_state.get("publish_runs", [])
+                                if r["run_id"] == ctx.layout.run_id],
+                  PUBLISH_STATES, "Publishing", "refresh_publish")
+    busy = busy_with()
+    if busy:
+        st.info(f"Publish is available again when this is done: {'; '.join(busy)}.")
+    if st.button(label, type="primary" if waiting > 0 else "secondary",
+                 disabled=bool(busy)):
+        publish_with_airflow(ctx)
 
 
 def page_progress(ctx: Context) -> None:
@@ -1145,30 +1214,161 @@ AIRFLOW_STATES = {
 }
 
 
-def show_airflow_runs(layout: Layout) -> None:
-    """Uploaded files sent to Airflow from this session, with their state."""
+def show_dag_runs(dag_id: str, runs: list[dict], states: dict, title: str,
+                  key: str) -> None:
+    """Runs of a DAG started from this session, with their state."""
 
-    runs = [r for r in st.session_state.get("airflow_runs", [])
-            if r["run_id"] == layout.run_id]
     if not runs:
         return
     with st.container(border=True):
-        st.markdown("#### Files sent to Airflow")
+        st.markdown(f"#### {title}")
         finished = True
         for sent in runs:
             try:
-                state = airflow_trigger.run_state(CORRECTIONS_DAG, sent["dag_run"])
+                state = airflow_trigger.run_state(dag_id, sent["dag_run"])
             except airflow_trigger.AirflowError as error:
                 state, text, show = "unknown", f"State unknown: {error}", st.warning
             else:
-                text, show = AIRFLOW_STATES.get(state, (state, st.info))
+                text, show = states.get(state, (state, st.info))
             finished = finished and state in ("success", "failed")
-            link = airflow_trigger.run_link(CORRECTIONS_DAG, sent["dag_run"])
+            link = airflow_trigger.run_link(dag_id, sent["dag_run"])
             show(f"**{Path(sent['file']).name}**: {text}"
                  + (f" ([open in Airflow]({link}))" if link else ""))
-        if st.button("Refresh", disabled=finished):
+        if st.button("Refresh", disabled=finished, key=key):
             st.cache_data.clear()
             st.rerun()
+
+
+def show_airflow_runs(layout: Layout) -> None:
+    """Uploaded correction files sent to Airflow from this session."""
+
+    show_dag_runs(CORRECTIONS_DAG, [r for r in st.session_state.get("airflow_runs", [])
+                                    if r["run_id"] == layout.run_id],
+                  AIRFLOW_STATES, "Files sent to Airflow", "refresh_corrections")
+
+
+# ============================================================
+# Load new data through Airflow (dq_ingest_validate)
+# ============================================================
+
+INGEST_DAG = "dq_ingest_validate"
+UPLOADS_FOLDER = Path("data") / "raw" / "uploads"
+INGEST_STATES = {
+    "queued": ("Waiting to start", st.info),
+    "running": ("Loading and checking the data...", st.info),
+    "success": ("Done: loaded, checked and published. Records with problems "
+                "are waiting in Fix records (pick the new batch in Settings).",
+                st.success),
+    "failed": ("Failed: ask whoever runs Airflow to look at this run.", st.error),
+}
+
+
+def file_name_part(text: str) -> str:
+    return re.sub(r"[^A-Za-z0-9_-]+", "_", text).strip("_")
+
+
+def loaded_as(dataset: str, sha256: str) -> str | None:
+    """The ingestion that already holds a file with this content."""
+
+    with db.transaction() as conn:
+        row = conn.execute(
+            "SELECT ingestion_id FROM bronze.ingestion "
+            "WHERE dataset = %s AND sha256 = %s ORDER BY ingestion_id LIMIT 1",
+            (dataset, sha256),
+        ).fetchone()
+    return row[0] if row else None
+
+
+def read_header(content: bytes) -> list[str]:
+    first = content[:1 << 16].decode("utf-8-sig", errors="replace").splitlines()
+    return next(csv.reader(first[:1]), []) if first else []
+
+
+def send_new_data(dataset: str, user: str, name: str, content: bytes) -> None:
+    """Save the file where Airflow reads it and trigger dq_ingest_validate."""
+
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    relative = (UPLOADS_FOLDER / dataset /
+                f"{stamp}_{file_name_part(user) or 'user'}_"
+                f"{file_name_part(Path(name).stem) or 'data'}.csv")
+    (ROOT / relative).parent.mkdir(parents=True, exist_ok=True)
+    (ROOT / relative).write_bytes(content)
+    try:
+        dag_run = airflow_trigger.trigger(INGEST_DAG, {"input": relative.as_posix()})
+    except airflow_trigger.AirflowError as error:
+        st.error(f"The file could not be handed to Airflow: {error}")
+        return
+    st.session_state["ingest_runs"] = [
+        {"dag_run": dag_run, "file": name},
+        *st.session_state.get("ingest_runs", []),
+    ][:5]
+    st.rerun()
+
+
+def show_ingest_runs() -> None:
+    """New data files sent to Airflow from this session."""
+
+    show_dag_runs(INGEST_DAG, st.session_state.get("ingest_runs", []),
+                  INGEST_STATES, "Files being loaded", "refresh_ingest")
+
+
+def page_load(registry: Registry, user: str) -> None:
+    st.title("Load new data")
+    st.caption("Upload a new data file (CSV). It is loaded, checked and the "
+               "valid records are published; records with problems wait in "
+               "Fix records. A file that was loaded before is not loaded again; "
+               "records already in the data are only updated when their values "
+               "changed.")
+    show_ingest_runs()
+    if not airflow_trigger.enabled():
+        st.info("Loading files from here needs Airflow (AIRFLOW_API_URL). "
+                "Without it: python dq.py pipeline --input <file>.")
+        return
+
+    dataset = registry.dataset.get("name", "dataset")
+    uploaded = st.file_uploader("Data file", type=["csv"], key="new_data")
+    if uploaded is None:
+        return
+    content = uploaded.getvalue()
+
+    header = read_header(content)
+    expected = list(registry.columns)
+    key = list(registry.dataset.get("primary_key") or [])
+    missing = [c for c in expected if c not in header]
+    extra = [c for c in header if c not in expected]
+    previous = loaded_as(dataset, hashlib.sha256(content).hexdigest())
+
+    sizes = st.columns(3)
+    sizes[0].metric("Size", f"{len(content) / 1e6:,.1f} MB")
+    sizes[1].metric("Columns", len(header))
+    lines = max(content.count(b"\n") - 1, 0)
+    sizes[2].metric("Lines", f"{lines:,}")
+    try:
+        st.dataframe(pd.read_csv(io.BytesIO(content), nrows=5, dtype=str,
+                                 keep_default_na=False, encoding="utf-8-sig"),
+                     hide_index=True)
+    except (ValueError, UnicodeDecodeError) as error:
+        st.error(f"The file cannot be read as CSV: {error}")
+        return
+
+    problems = []
+    if previous:
+        problems.append(f"This exact file was already loaded ({run_label(previous)}).")
+    if missing_key := [c for c in key if c not in header]:
+        problems.append(f"The file has no {', '.join(missing_key)} column.")
+    if problems:
+        for problem in problems:
+            st.error(problem)
+        return
+    if missing:
+        st.warning(f"Columns missing from the file (their checks will fail): "
+                   f"{', '.join(missing)}")
+    if extra:
+        st.warning(f"Columns the data does not know (loaded as they are): "
+                   f"{', '.join(extra)}")
+
+    if st.button(f"Load {uploaded.name}", type="primary"):
+        send_new_data(dataset, user, uploaded.name, content)
 
 
 # ============================================================
@@ -1200,35 +1400,40 @@ def main() -> None:
     dataset = registry.dataset.get("name", "dataset")
 
     runs = list_runs(dataset)
-    if not runs:
-        st.info("There is no checked data yet.")
-        return
 
     with st.sidebar:
         st.title("Data corrections")
         user = st.text_input("Your name", value=getpass.getuser()).strip()
-        with st.expander("Settings"):
-            run_id = st.selectbox("Data batch", runs[::-1], format_func=run_label)
-            max_attempts = st.number_input(
-                "Send an expert a record after this many failed checks",
-                1, 20, DEFAULT_MAX_ATTEMPTS,
-            )
+        if runs:
+            with st.expander("Settings"):
+                run_id = st.selectbox("Data batch", runs[::-1], format_func=run_label)
+                max_attempts = st.number_input(
+                    "Send an expert a record after this many failed checks",
+                    1, 20, DEFAULT_MAX_ATTEMPTS,
+                )
 
-    layout = Layout(dataset, run_id)
-    pending = len(my_changes(layout))
-    pages = {
-        "Fix records": page_fix,
-        f"My changes ({pending})": page_changes,
-        "Progress": page_progress,
-        "Upload a file": page_upload,
-    }
+    pages = {}
+    if runs:
+        layout = Layout(dataset, run_id)
+        pending = len(my_changes(layout))
+        pages = {
+            "Fix records": page_fix,
+            f"My changes ({pending})": page_changes,
+            "Progress": page_progress,
+            "Upload a file": page_upload,
+        }
+    pages["Load new data"] = None
     with st.sidebar:
         page = st.radio("Go to", list(pages), label_visibility="collapsed")
 
-    show_last_send(layout)
+    if runs:
+        show_last_send(layout)
     if not user:
         st.warning("Enter your name in the sidebar first; it is saved with "
                    "every change.")
+        return
+    if pages[page] is None:
+        page_load(registry, user)
         return
 
     ctx = Context(args, registry, get_wording(str(args.rules)), layout,

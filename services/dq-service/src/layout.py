@@ -16,8 +16,11 @@ A run is one ingestion (its ingestion id) or an ad hoc file (a timestamp).
     dq.remediation_audit      every automatic repair, per round
     dq.round_result           summary of every round
     silver.<dataset>          clean data, typed: valid records plus
-                              resolved ones, one row per record
+                              resolved ones, one row per primary key (the
+                              newest run's version; see load_into_silver)
     dq.merge_result           counts and checks of the latest merge
+    dq.load_log               every load into silver (initial or
+                              incremental) with its counts
 
 Record values are stored as text, exactly as the engine writes them
 (silver.<dataset> has typed columns, see merge.py). Round 1 is the first
@@ -32,6 +35,7 @@ interrupted step leaves nothing that counts and can simply run again.
 from __future__ import annotations
 
 import json
+import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -82,6 +86,7 @@ CORRECTIONS = sql.Identifier("dq", "correction")
 CORRECTION_LOG = sql.Identifier("dq", "correction_log")
 REJECTIONS = sql.Identifier("dq", "import_rejection")
 MERGE_RESULT = sql.Identifier("dq", "merge_result")
+LOAD_LOG = sql.Identifier("dq", "load_log")
 
 # Extra columns of each record table after the data columns.
 RECORD_EXTRA = {
@@ -90,6 +95,63 @@ RECORD_EXTRA = {
     "resolved": ["dq_warnings"],
     "silver": ["dq_warnings"],
 }
+
+
+def _primary_key(conn, schema: str, name: str) -> list[str]:
+    """Columns of the table's primary key, in order."""
+
+    row = conn.execute(
+        "SELECT array_agg(a.attname::text ORDER BY k.n) FROM pg_index i "
+        "CROSS JOIN LATERAL unnest(i.indkey) WITH ORDINALITY AS k(attnum, n) "
+        "JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = k.attnum "
+        "WHERE i.indrelid = to_regclass(%s) AND i.indisprimary",
+        (db.qualified(schema, name),),
+    ).fetchone()
+    return list(row[0] or [])
+
+
+def _add_silver_keys(conn, schema: str, name: str, key: list[str]) -> None:
+    """Primary key, unique record ids and the load time of silver."""
+
+    table = sql.Identifier(schema, name)
+    conn.execute(sql.SQL(
+        "ALTER TABLE {} ADD COLUMN IF NOT EXISTS loaded_at timestamptz NOT NULL DEFAULT now()"
+    ).format(table))
+    conn.execute(sql.SQL("ALTER TABLE {} ADD CONSTRAINT {} PRIMARY KEY ({})").format(
+        table, sql.Identifier(f"{name}_key"[:63]),
+        sql.SQL(", ").join(map(sql.Identifier, key))))
+    conn.execute(sql.SQL("ALTER TABLE {} ADD CONSTRAINT {} UNIQUE (record_id)").format(
+        table, sql.Identifier(f"{name}_record"[:63])))
+
+
+def _convert_silver(conn, schema: str, name: str, key: list[str]) -> None:
+    """Silver of an earlier version (one row per run and record) -> one row
+    per key, the newest run's; the old table is kept as <name>_by_run."""
+
+    table = sql.Identifier(schema, name)
+    old_name = f"{name}_by_run"[:63]
+    old = sql.Identifier(schema, old_name)
+    if db.table_columns(conn, schema, old_name):
+        raise LayoutError(f"{schema}.{old_name} already exists; cannot convert "
+                          f"{schema}.{name} to one row per key.")
+    conn.execute(sql.SQL("ALTER TABLE {} RENAME TO {}").format(
+        table, sql.Identifier(old_name)))
+    for (constraint,) in conn.execute(
+        "SELECT conname::text FROM pg_constraint WHERE conrelid = to_regclass(%s) "
+        "AND contype IN ('p', 'u')", (db.qualified(schema, old_name),),
+    ).fetchall():
+        conn.execute(sql.SQL("ALTER TABLE {} RENAME CONSTRAINT {} TO {}").format(
+            old, sql.Identifier(constraint),
+            sql.Identifier(f"{old_name}_{constraint}"[:63])))
+    conn.execute(sql.SQL("CREATE TABLE {} (LIKE {})").format(table, old))
+    keys = sql.SQL(", ").join(map(sql.Identifier, key))
+    present = sql.SQL(" AND ").join(
+        sql.SQL("{} IS NOT NULL").format(sql.Identifier(k)) for k in key)
+    conn.execute(sql.SQL(
+        "INSERT INTO {} SELECT DISTINCT ON ({}) * FROM {} WHERE {} "
+        "ORDER BY {}, run_id DESC, record_id DESC"
+    ).format(table, keys, old, present, keys))
+    _add_silver_keys(conn, schema, name, key)
 
 
 def _json(value: Any) -> Jsonb:
@@ -425,25 +487,123 @@ class Layout:
 
     # ---- Clean data ----
 
-    def prepare_silver(self, types: dict[str, str]) -> str:
-        """Create silver.<dataset> with typed columns (or add the columns it
-        lacks), remove the run's rows and return its name for Spark."""
+    def prepare_silver(self, types: dict[str, str], key: list[str]) -> str:
+        """Create silver.<dataset> keyed by the primary key (or add the
+        columns it lacks) and an empty staging table for the run's rows;
+        returns the staging table's name for Spark.
+
+        Silver made by earlier versions (one row per run and record) is
+        converted once: the newest version of every key is kept and the old
+        table stays as silver.<dataset>_by_run.
+        """
 
         schema, name = db.record_table_name(self.dataset, "silver")
         table = sql.Identifier(schema, name)
         with db.transaction() as conn:
             existing = db.table_columns(conn, schema, name)
+            if existing and _primary_key(conn, schema, name) != key:
+                _convert_silver(conn, schema, name, key)
+                existing = db.table_columns(conn, schema, name)
             if not existing:
                 conn.execute(sql.SQL(
-                    "CREATE TABLE {} (run_id text NOT NULL, record_id text NOT NULL, "
-                    "PRIMARY KEY (run_id, record_id))"
+                    "CREATE TABLE {} (run_id text NOT NULL, record_id text NOT NULL)"
                 ).format(table))
             for column, kind in {**types, "dq_warnings": "text"}.items():
                 if column not in existing:
                     conn.execute(sql.SQL("ALTER TABLE {} ADD COLUMN IF NOT EXISTS {} {}")
                                  .format(table, sql.Identifier(column), sql.SQL(kind)))
-            db.delete(conn, table, {"run_id": self.run_id})
-        return db.qualified(schema, name)
+            if not existing:
+                _add_silver_keys(conn, schema, name, key)
+
+            stage = f"_stage_{uuid.uuid4().hex[:12]}"
+            conn.execute(sql.SQL("CREATE TABLE {} (LIKE {})").format(
+                sql.Identifier(schema, stage), table))
+            conn.execute(sql.SQL("ALTER TABLE {} DROP COLUMN loaded_at").format(
+                sql.Identifier(schema, stage)))
+        return db.qualified(schema, stage)
+
+    def drop_stage(self, stage: str) -> None:
+        schema, _ = db.record_table_name(self.dataset, "silver")
+        name = stage.split(".", 1)[1].strip('"')
+        with db.transaction() as conn:
+            conn.execute(sql.SQL("DROP TABLE IF EXISTS {}").format(
+                sql.Identifier(schema, name)))
+
+    def load_into_silver(self, stage: str, key: list[str]) -> dict[str, Any]:
+        """Upsert the staged rows of the run into silver by primary key, in
+        one transaction, and log the load in dq.load_log.
+
+        A staged row is inserted (new key), updated (its values differ and
+        silver's version is not from a newer run), unchanged (same values;
+        silver keeps its row and lineage) or older (silver holds a newer
+        run's version, which stays). Rows of this run that the staged rows
+        no longer hold (an earlier merge of it) are removed. The counts
+        must add up, or nothing is loaded.
+        """
+
+        schema, name = db.record_table_name(self.dataset, "silver")
+        table = sql.Identifier(schema, name)
+        staged_table = sql.Identifier(schema, stage.split(".", 1)[1].strip('"'))
+        with db.transaction() as conn:
+            conn.execute(sql.SQL("LOCK TABLE {} IN SHARE ROW EXCLUSIVE MODE").format(table))
+            columns = db.table_columns(conn, schema, name)
+            data = [c for c in columns if c not in ("loaded_at", *key)]
+            changing = [c for c in data if c not in ("run_id", "record_id")]
+            on_key = sql.SQL(" AND ").join(
+                sql.SQL("s.{0} = t.{0}").format(sql.Identifier(k)) for k in key)
+
+            def count(query: str, *parts: sql.Composable) -> int:
+                return conn.execute(sql.SQL(query).format(*parts)).fetchone()[0]
+
+            before = count("SELECT count(*) FROM {}", table)
+            staged = count("SELECT count(*) FROM {}", staged_table)
+            older = count("SELECT count(*) FROM {} s JOIN {} t ON {} "
+                          "WHERE t.run_id > s.run_id", staged_table, table, on_key)
+            removed = conn.execute(sql.SQL(
+                "DELETE FROM {} t WHERE t.run_id = {} AND NOT EXISTS "
+                "(SELECT 1 FROM {} s WHERE s.record_id = t.record_id)"
+            ).format(table, sql.Literal(self.run_id), staged_table)).rowcount
+
+            names = sql.SQL(", ").join(map(sql.Identifier, [*key, *data]))
+            inserted, updated = conn.execute(sql.SQL(
+                "WITH loaded AS ("
+                " INSERT INTO {table} AS t ({names}, loaded_at)"
+                " SELECT {names}, now() FROM {stage}"
+                " ON CONFLICT ({key}) DO UPDATE SET {sets}, loaded_at = now()"
+                " WHERE t.run_id <= EXCLUDED.run_id"
+                " AND ({old}) IS DISTINCT FROM ({new})"
+                " RETURNING (xmax = 0) AS is_new)"
+                " SELECT count(*) FILTER (WHERE is_new), count(*) FILTER (WHERE NOT is_new)"
+                " FROM loaded"
+            ).format(
+                table=table, names=names, stage=staged_table,
+                key=sql.SQL(", ").join(map(sql.Identifier, key)),
+                sets=sql.SQL(", ").join(
+                    sql.SQL("{0} = EXCLUDED.{0}").format(sql.Identifier(c)) for c in data),
+                old=sql.SQL(", ").join(
+                    sql.SQL("t.{}").format(sql.Identifier(c)) for c in changing),
+                new=sql.SQL(", ").join(
+                    sql.SQL("EXCLUDED.{}").format(sql.Identifier(c)) for c in changing),
+            )).fetchone()
+            after = count("SELECT count(*) FROM {}", table)
+
+            load = {
+                "mode": "initial" if before == 0 else "incremental",
+                "staged": staged, "inserted": inserted, "updated": updated,
+                "unchanged": staged - inserted - updated - older, "older": older,
+                "removed": removed, "silver_rows_before": before,
+                "silver_rows_after": after,
+            }
+            if load["unchanged"] < 0 or after != before + inserted - removed:
+                raise LayoutError(f"Silver load of {self.run_id} does not add up: {load}")
+            conn.execute(sql.SQL(
+                "INSERT INTO {} (dataset, run_id, {}) VALUES ({}, {}, {})"
+            ).format(
+                LOAD_LOG, sql.SQL(", ").join(map(sql.Identifier, load)),
+                sql.Literal(self.dataset), sql.Literal(self.run_id),
+                sql.SQL(", ").join(map(sql.Literal, load.values())),
+            ))
+        return load
 
     def save_merge_result(self, summary: dict[str, Any]) -> None:
         with db.transaction() as conn:
