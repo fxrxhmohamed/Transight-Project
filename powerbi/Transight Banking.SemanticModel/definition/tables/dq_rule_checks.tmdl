@@ -1,0 +1,169 @@
+/// semantic.dq_rule_checks: one row per run and rule of the first validation round.
+table dq_rule_checks
+	lineageTag: 6bac807a-25c8-501e-bbce-76c6ab0392d4
+
+	/// values_checked: sum(checked), first validation round
+	measure 'Values Checked' = SUM ( 'dq_rule_checks'[checked] )
+		formatString: #,0
+		displayFolder: DQ Rules
+		lineageTag: 1e152549-2412-50ee-974f-068a2a4523bb
+
+	/// values_failed: sum(failed)
+	measure 'Values Failed' = SUM ( 'dq_rule_checks'[failed] )
+		formatString: #,0
+		displayFolder: DQ Rules
+		lineageTag: 74d69220-1965-5783-96f6-191805086297
+
+	/// values_repaired: sum(repaired)
+	measure 'Values Repaired' = SUM ( 'dq_rule_checks'[repaired] )
+		formatString: #,0
+		displayFolder: DQ Rules
+		lineageTag: a7873a1d-e65e-56eb-a3d1-59390f032afd
+
+	/// sum(unresolved)
+	measure 'Values Unresolved' = SUM ( 'dq_rule_checks'[unresolved] )
+		formatString: #,0
+		displayFolder: DQ Rules
+		lineageTag: 7d94895d-ea93-5c9a-9f6a-ed50f1e2ed5c
+
+	/// rule_failure_rate: values_failed / values_checked
+	measure 'Rule Failure Rate %' = DIVIDE ( [Values Failed], [Values Checked] )
+		formatString: 0.000%
+		displayFolder: DQ Rules
+		lineageTag: 75c72475-f123-5261-bc7a-d50e50420e03
+
+	/// rule_repair_rate: values_repaired / values_failed
+	measure 'Rule Repair Rate %' = DIVIDE ( [Values Repaired], [Values Failed] )
+		formatString: 0.0%
+		displayFolder: DQ Rules
+		lineageTag: ac9ec913-c853-536b-b73b-f4e9fc5101f3
+
+	/// distinct rules checked
+	measure 'Rules Evaluated' = DISTINCTCOUNT ( 'dq_rule_checks'[rule_id] )
+		formatString: #,0
+		displayFolder: DQ Rules
+		lineageTag: 13837ad5-6701-5174-b1df-dc313d699dc9
+
+	/// distinct rules that failed at least one value
+	measure 'Rules with Failures' = CALCULATE ( DISTINCTCOUNT ( 'dq_rule_checks'[rule_id] ), 'dq_rule_checks'[failed] > 0 )
+		formatString: #,0
+		displayFolder: DQ Rules
+		lineageTag: c6a1b390-5428-5279-9357-78c04eca59e9
+
+	column rule_check_id
+		dataType: string
+		isHidden
+		lineageTag: 1210f76a-304a-5153-a5cb-b0e56b4c3be1
+		summarizeBy: none
+		sourceColumn: rule_check_id
+
+	column run_id
+		dataType: string
+		lineageTag: 6b220542-b66f-5f4e-a3e2-c070d4741f5c
+		summarizeBy: none
+		sourceColumn: run_id
+
+	column dataset
+		dataType: string
+		lineageTag: 7d48c9bb-884e-5cae-8d3f-1c91c009d897
+		summarizeBy: none
+		sourceColumn: dataset
+
+	column run_date
+		dataType: dateTime
+		formatString: yyyy-mm-dd
+		lineageTag: 18b458a9-c177-52b0-89a4-cbd185d6a582
+		summarizeBy: none
+		sourceColumn: run_date
+
+		annotation UnderlyingDateTimeDataType = Date
+
+	column rule_id
+		dataType: string
+		lineageTag: 4d905efc-6d6d-5e57-83e4-448a70160eca
+		summarizeBy: none
+		sourceColumn: rule_id
+
+	column rule_name
+		dataType: string
+		lineageTag: a838ad44-f61b-545c-bdf1-14fe4aecff01
+		summarizeBy: none
+		sourceColumn: rule_name
+
+	column rule_type
+		dataType: string
+		lineageTag: aa58f8c7-1c59-5a51-93cd-6fedb83067ea
+		summarizeBy: none
+		sourceColumn: rule_type
+
+	column column_name
+		dataType: string
+		lineageTag: bd845014-3ba6-5da8-a6ea-1ce08d6ec15f
+		summarizeBy: none
+		sourceColumn: column_name
+
+	column dq_dimension
+		dataType: string
+		lineageTag: a94d749d-d0b3-5376-8fb2-0b494b293a5d
+		summarizeBy: none
+		sourceColumn: dq_dimension
+
+	column severity
+		dataType: string
+		lineageTag: 1d89c639-2d3d-5446-a5d3-821f32c75fee
+		summarizeBy: none
+		sourceColumn: severity
+
+	column error_code
+		dataType: string
+		lineageTag: 40d4e31b-3117-5260-9f79-9a79ab67813b
+		summarizeBy: none
+		sourceColumn: error_code
+
+	column origin
+		dataType: string
+		lineageTag: 29badb45-5f3a-524f-960c-2ca924a05771
+		summarizeBy: none
+		sourceColumn: origin
+
+	column checked
+		dataType: int64
+		isHidden
+		formatString: #,0
+		lineageTag: 9dee4199-edd3-5cd9-a1b6-d83c8c200b39
+		summarizeBy: none
+		sourceColumn: checked
+
+	column failed
+		dataType: int64
+		isHidden
+		formatString: #,0
+		lineageTag: 118b3f90-0384-5917-968c-ef5377e88c34
+		summarizeBy: none
+		sourceColumn: failed
+
+	column repaired
+		dataType: int64
+		isHidden
+		formatString: #,0
+		lineageTag: e2bb9377-4844-59a4-a73a-78a516dfdf74
+		summarizeBy: none
+		sourceColumn: repaired
+
+	column unresolved
+		dataType: int64
+		isHidden
+		formatString: #,0
+		lineageTag: 50a70e80-598a-5cd7-aba0-db7ad7adab43
+		summarizeBy: none
+		sourceColumn: unresolved
+
+	partition dq_rule_checks = m
+		mode: import
+		source =
+				let
+				    Source = PostgreSQL.Database(PgServer, PgDatabase),
+				    Data = Source{[Schema = "semantic", Item = "dq_rule_checks"]}[Data]
+				in
+				    Data
+

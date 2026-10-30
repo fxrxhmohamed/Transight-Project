@@ -1,0 +1,36 @@
+relationship 83cb28aa-fea0-5fc2-9939-1d80e67e5575
+	fromColumn: fact_transaction.transaction_date
+	toColumn: dim_date.date_key
+
+relationship 1d7e8e52-4cfe-5b5e-b46f-7c452030565d
+	fromColumn: fact_transaction.customer_id
+	toColumn: dim_customer.customer_id
+
+relationship 31bf86e9-5590-54ce-8468-b97b0dfcd09b
+	fromColumn: fact_transaction.account_id
+	toColumn: dim_account.account_id
+
+relationship 4e0c370a-cb8f-519b-a748-7a580b699dad
+	fromColumn: fact_transaction.branch_id
+	toColumn: dim_branch.branch_id
+
+relationship 772a1e10-6cc1-54d5-8a23-99f859018aa9
+	fromColumn: fact_transaction.bank_id
+	toColumn: dim_bank.bank_id
+
+relationship 8e384a20-fe25-5d64-89ba-cb672767ebe3
+	fromColumn: dq_rule_checks.run_id
+	toColumn: dq_runs.run_id
+
+relationship 76a8fec6-fb7a-5441-9bdb-a06fd3e37f50
+	fromColumn: dq_run_rounds.run_id
+	toColumn: dq_runs.run_id
+
+relationship 7d4e5568-0a95-5567-b933-4a02031d18b0
+	fromColumn: dq_correction_summary.run_id
+	toColumn: dq_runs.run_id
+
+relationship 510163c5-1d9e-52f8-a786-6eb7f86d170c
+	fromColumn: dq_quarantine_status.run_id
+	toColumn: dq_runs.run_id
+

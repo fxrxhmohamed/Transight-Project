@@ -1,0 +1,176 @@
+{
+  "$schema": "https://developer.microsoft.com/json-schemas/fabric/item/report/definition/visualContainer/2.4.0/schema.json",
+  "name": "3979d3c9968953088f50",
+  "position": {
+    "x": 16,
+    "y": 232,
+    "z": 14000,
+    "height": 250,
+    "width": 380,
+    "tabOrder": 14000
+  },
+  "visual": {
+    "visualType": "clusteredBarChart",
+    "query": {
+      "queryState": {
+        "Y": {
+          "projections": [
+            {
+              "field": {
+                "Measure": {
+                  "Expression": {
+                    "SourceRef": {
+                      "Entity": "dq_runs"
+                    }
+                  },
+                  "Property": "Valid Records"
+                }
+              },
+              "queryRef": "dq_runs.Valid Records",
+              "nativeQueryRef": "Valid Records",
+              "displayName": "Valid on first pass"
+            },
+            {
+              "field": {
+                "Measure": {
+                  "Expression": {
+                    "SourceRef": {
+                      "Entity": "dq_runs"
+                    }
+                  },
+                  "Property": "Auto-Fixed Records"
+                }
+              },
+              "queryRef": "dq_runs.Auto-Fixed Records",
+              "nativeQueryRef": "Auto-Fixed Records",
+              "displayName": "Auto-fixed"
+            },
+            {
+              "field": {
+                "Measure": {
+                  "Expression": {
+                    "SourceRef": {
+                      "Entity": "dq_runs"
+                    }
+                  },
+                  "Property": "Quarantined Records"
+                }
+              },
+              "queryRef": "dq_runs.Quarantined Records",
+              "nativeQueryRef": "Quarantined Records",
+              "displayName": "Quarantined"
+            },
+            {
+              "field": {
+                "Measure": {
+                  "Expression": {
+                    "SourceRef": {
+                      "Entity": "dq_runs"
+                    }
+                  },
+                  "Property": "Resolved Records"
+                }
+              },
+              "queryRef": "dq_runs.Resolved Records",
+              "nativeQueryRef": "Resolved Records",
+              "displayName": "Resolved after quarantine"
+            },
+            {
+              "field": {
+                "Measure": {
+                  "Expression": {
+                    "SourceRef": {
+                      "Entity": "dq_runs"
+                    }
+                  },
+                  "Property": "Unresolved Records"
+                }
+              },
+              "queryRef": "dq_runs.Unresolved Records",
+              "nativeQueryRef": "Unresolved Records",
+              "displayName": "Still unresolved"
+            }
+          ]
+        }
+      }
+    },
+    "objects": {
+      "labels": [
+        {
+          "properties": {
+            "show": {
+              "expr": {
+                "Literal": {
+                  "Value": "true"
+                }
+              }
+            }
+          }
+        }
+      ],
+      "legend": [
+        {
+          "properties": {
+            "show": {
+              "expr": {
+                "Literal": {
+                  "Value": "true"
+                }
+              }
+            },
+            "position": {
+              "expr": {
+                "Literal": {
+                  "Value": "'Top'"
+                }
+              }
+            }
+          }
+        }
+      ]
+    },
+    "visualContainerObjects": {
+      "title": [
+        {
+          "properties": {
+            "show": {
+              "expr": {
+                "Literal": {
+                  "Value": "true"
+                }
+              }
+            },
+            "text": {
+              "expr": {
+                "Literal": {
+                  "Value": "'Record outcomes'"
+                }
+              }
+            }
+          }
+        }
+      ],
+      "subTitle": [
+        {
+          "properties": {
+            "show": {
+              "expr": {
+                "Literal": {
+                  "Value": "true"
+                }
+              }
+            },
+            "text": {
+              "expr": {
+                "Literal": {
+                  "Value": "'Auto-fixed records are also counted as valid'"
+                }
+              }
+            }
+          }
+        }
+      ]
+    },
+    "drillFilterOtherVisuals": true
+  }
+}

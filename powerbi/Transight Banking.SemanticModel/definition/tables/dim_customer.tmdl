@@ -1,0 +1,148 @@
+/// gold.dim_customer without personal data, plus age band (age on the last data day) and income quintile.
+table dim_customer
+	lineageTag: 1c98ab63-e9c4-5edd-adea-02f3502576ea
+
+	column customer_id
+		dataType: string
+		lineageTag: 53b00041-08c3-59e4-b4a6-03c3c1fb2e26
+		summarizeBy: none
+		sourceColumn: customer_id
+
+	column gender
+		dataType: string
+		lineageTag: e73ca3c1-7db1-5c69-bb1c-f0a450c781ee
+		summarizeBy: none
+		sourceColumn: gender
+
+	column marital_status
+		dataType: string
+		lineageTag: 8347636d-4951-5699-9ed9-996dd6955d47
+		summarizeBy: none
+		sourceColumn: marital_status
+
+	column customer_city
+		dataType: string
+		lineageTag: f2ec0c18-76d3-5aac-9312-b352cc9feba5
+		summarizeBy: none
+		sourceColumn: customer_city
+
+	column customer_governorate
+		dataType: string
+		lineageTag: f6f79ae7-a112-507e-ba23-bd724b14e967
+		summarizeBy: none
+		sourceColumn: customer_governorate
+
+	column customer_segment
+		dataType: string
+		lineageTag: 24a6e442-816c-523d-ad0b-4852573be47d
+		summarizeBy: none
+		sourceColumn: customer_segment
+
+	column occupation
+		dataType: string
+		lineageTag: fb9e090c-17cb-5519-9106-17ee462cdce6
+		summarizeBy: none
+		sourceColumn: occupation
+
+	column annual_income
+		dataType: double
+		formatString: #,0
+		lineageTag: 1575dbd7-477c-5492-b891-703c16b49524
+		summarizeBy: none
+		sourceColumn: annual_income
+
+	column credit_score
+		dataType: int64
+		formatString: 0
+		lineageTag: 2464a31d-6f28-5924-8e39-12a3efe87862
+		summarizeBy: none
+		sourceColumn: credit_score
+
+	column customer_since_date
+		dataType: dateTime
+		formatString: yyyy-mm-dd
+		lineageTag: 7128a530-f415-5bbd-8516-5cef49309051
+		summarizeBy: none
+		sourceColumn: customer_since_date
+
+		annotation UnderlyingDateTimeDataType = Date
+
+	column age_at_data_end
+		dataType: int64
+		formatString: 0
+		lineageTag: fa47f010-bc43-5a39-99ad-b421c42c1ac5
+		summarizeBy: none
+		sourceColumn: age_at_data_end
+
+	column age_band_order
+		dataType: int64
+		isHidden
+		formatString: 0
+		lineageTag: 821ce0fe-1d6f-58e2-a516-f1e6595d7d4a
+		summarizeBy: none
+		sourceColumn: age_band_order
+
+	column age_band
+		dataType: string
+		lineageTag: e6a06a50-7d92-5c96-af82-029f944ad78f
+		summarizeBy: none
+		sourceColumn: age_band
+		sortByColumn: age_band_order
+
+	column income_quintile
+		dataType: int64
+		isHidden
+		formatString: 0
+		lineageTag: 197acf5b-a020-5764-bf78-6bc33ed1c4f0
+		summarizeBy: none
+		sourceColumn: income_quintile
+
+	column income_band
+		dataType: string
+		lineageTag: f4defe97-fd7f-5557-baf1-0cb689252569
+		summarizeBy: none
+		sourceColumn: income_band
+		sortByColumn: income_quintile
+
+	partition dim_customer = m
+		mode: import
+		source =
+				let
+				    Source = PostgreSQL.Database(PgServer, PgDatabase),
+				    Customers = Source{[Schema = "gold", Item = "dim_customer"]}[Data],
+				    // no names, e-mail or phone: the report does not need personal data
+				    Selected = Table.Buffer(Table.SelectColumns(Customers, {
+				        "customer_id", "gender", "date_of_birth", "marital_status", "customer_city",
+				        "customer_governorate", "customer_segment", "occupation", "annual_income",
+				        "credit_score", "customer_since_date"})),
+				    // age on the last day the data covers (gold.dim_date spans the facts)
+				    RefDate = List.Max(Source{[Schema = "gold", Item = "dim_date"]}[Data][date_key]),
+				    WithAge = Table.AddColumn(Selected, "age_at_data_end", each
+				        Date.Year(RefDate) - Date.Year([date_of_birth])
+				            - (if Date.Month([date_of_birth]) * 100 + Date.Day([date_of_birth])
+				                > Date.Month(RefDate) * 100 + Date.Day(RefDate) then 1 else 0), Int64.Type),
+				    WithAgeOrder = Table.AddColumn(WithAge, "age_band_order", each
+				        let a = [age_at_data_end] in
+				        if a < 25 then 1 else if a < 35 then 2 else if a < 45 then 3
+				        else if a < 55 then 4 else if a < 65 then 5 else 6, Int64.Type),
+				    WithAgeBand = Table.AddColumn(WithAgeOrder, "age_band", each
+				        {"18-24", "25-34", "35-44", "45-54", "55-64", "65+"}{[age_band_order] - 1}, type text),
+				    // income quintiles: five equal-sized customer groups by annual_income
+				    Cuts = List.Percentile(List.Buffer(Selected[annual_income]), {0.2, 0.4, 0.6, 0.8}),
+				    WithQuintile = Table.AddColumn(WithAgeBand, "income_quintile", each
+				        let x = [annual_income] in
+				        if x <= Cuts{0} then 1 else if x <= Cuts{1} then 2 else if x <= Cuts{2} then 3
+				        else if x <= Cuts{3} then 4 else 5, Int64.Type),
+				    Short = (n as number) as text => if n >= 1000000 then Number.ToText(n / 1000000, "0.0", "en-US") & "M"
+				        else Number.ToText(n / 1000, "0", "en-US") & "K",
+				    Ranges = Table.Group(WithQuintile, {"income_quintile"}, {
+				        {"lo", each List.Min([annual_income]), type number},
+				        {"hi", each List.Max([annual_income]), type number}}),
+				    Labels = Table.AddColumn(Ranges, "income_band", each
+				        "Q" & Text.From([income_quintile]) & ": " & Short([lo]) & "–" & Short([hi]) & " EGP", type text),
+				    Joined = Table.Join(WithQuintile, "income_quintile",
+				        Table.SelectColumns(Labels, {"income_quintile", "income_band"}), "income_quintile"),
+				    Result = Table.RemoveColumns(Joined, {"date_of_birth"})
+				in
+				    Result
+

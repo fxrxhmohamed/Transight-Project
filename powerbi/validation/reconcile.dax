@@ -1,0 +1,76 @@
+// The figures of powerbi/validation/reconcile.sql from the Power BI model
+// (DAX query view, or any XMLA client on the model). Each query matches the
+// SQL query with the same number.
+
+// 1. Executive overview, no filters
+EVALUATE
+ROW (
+    "transactions", [Transactions],
+    "transaction_value_egp", [Transaction Value (EGP)],
+    "fee_revenue_egp", [Fee Revenue (EGP)],
+    "channel_cost_egp", [Channel Cost (EGP)],
+    "avg_transaction_value_egp", [Avg Transaction Value (EGP)],
+    "failure_rate", [Failure Rate %],
+    "digital_share", [Digital Share %],
+    "digital_adoption_rate", [Digital Adoption Rate %],
+    "assisted_transactions", [Assisted Transactions],
+    "migration_opportunities", [Migration Opportunities],
+    "potential_cost_savings_egp", [Potential Cost Savings (EGP)],
+    "fee_coverage", [Fee Coverage of Channel Cost %]
+)
+
+// 2. By year
+EVALUATE
+SUMMARIZECOLUMNS (
+    'dim_date'[year],
+    "transactions", [Transactions],
+    "transaction_value_egp", [Transaction Value (EGP)],
+    "transactions_yoy", [Transactions YoY %],
+    "value_yoy", [Transaction Value YoY %]
+)
+ORDER BY 'dim_date'[year]
+
+// 3. Status breakdown
+EVALUATE
+SUMMARIZECOLUMNS ( 'fact_transaction'[transaction_status], "transactions", [Transactions] )
+ORDER BY [transactions] DESC
+
+// 4. Top 3 banks by completed value
+EVALUATE
+TOPN (
+    3,
+    SUMMARIZECOLUMNS (
+        'dim_bank'[bank_name],
+        "transactions", [Transactions],
+        "transaction_value_egp", [Transaction Value (EGP)],
+        "failure_rate", [Failure Rate %]
+    ),
+    [transaction_value_egp], DESC
+)
+ORDER BY [transaction_value_egp] DESC
+
+// 5. Digital share by customer segment
+EVALUATE
+SUMMARIZECOLUMNS ( 'dim_customer'[customer_segment], "digital_share", [Digital Share %] )
+ORDER BY 'dim_customer'[customer_segment]
+
+// 6. Data quality
+EVALUATE
+ROW (
+    "processed_records", [Processed Records],
+    "records_with_issues", [Records with Issues],
+    "initial_dq_score", [Initial DQ Score %],
+    "final_dq_score", [Final DQ Score %],
+    "auto_fix_rate", [Auto-Fix Rate %],
+    "quarantine_resolution_rate", [Quarantine Resolution Rate %],
+    "unresolved_records", [Unresolved Records]
+)
+
+EVALUATE
+ROW (
+    "values_checked", [Values Checked],
+    "values_failed", [Values Failed],
+    "values_repaired", [Values Repaired],
+    "rule_failure_rate", [Rule Failure Rate %],
+    "rule_repair_rate", [Rule Repair Rate %]
+)

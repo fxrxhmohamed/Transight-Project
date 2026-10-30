@@ -8,6 +8,9 @@ repairs what is wrong with them, lets people fix what cannot be repaired
 automatically, and turns the result into a clean star schema with
 data-quality and business metrics for Power BI.
 
+Architecture, evaluation, models and cost, USP, target domains and
+on-premise deployment costs: [docs/project-overview.md](docs/project-overview.md).
+
 What the data should look like (columns, types, allowed values, ranges,
 relationships) is described in a schema registry, and how strictly it is
 enforced and repaired in a rules file. The pipeline lands each source file
@@ -28,7 +31,7 @@ source CSV
   -> correct      correction UI or a correction file   <- people
   -> revalidate   fixed records resolved, the rest back to quarantine
   -> merge        silver.<dataset> (valid + resolved)
-  -> metrics      metrics.dq_run, dq_rule_result, dq_quarantine, dq_correction (views)
+  -> metrics      semantic.dq_run, dq_rule_result, dq_quarantine, dq_correction (dbt)
   -> metadata     meta.* (what silver holds: entities, keys, relationships)
   -> gold         gold.fact_* / dim_* star schema
 ```
@@ -48,9 +51,14 @@ Transight/
 │
 ├── sql/
 │   ├── 01_bronze.sql            bronze schema (ingestion catalog, append-only)
-│   ├── 02_dq.sql                dq, silver and metrics schemas
+│   ├── 02_dq.sql                dq and silver schemas
 │   ├── 03_meta_gold.sql         meta and gold schemas
-│   └── 04_metrics.sql           DQ metric views for Power BI (metrics schema)
+│   └── 05_semantic.sql          semantic schema: metric definitions and values
+│
+├── dbt/                         semantic layer (one schema: semantic): the DQ
+│                                tables, every business and DQ metric (MetricFlow)
+├── semantic/                    Power BI measures over the fact table (DAX),
+│                                their catalog and a SQL check
 │
 ├── services/
 │   ├── common/src/              shared by every step
@@ -138,7 +146,7 @@ columns adds them to the table (NULL for earlier rows).
 
 ### Data quality, silver and metrics
 
-`sql/02_dq.sql` creates the `dq`, `silver` and `metrics` schemas. Record
+`sql/02_dq.sql` creates the `dq` and `silver` schemas. Record
 tables are created per dataset, with `record_id` and one `text` column per
 data column (values as the engine cleaned them):
 
@@ -158,7 +166,7 @@ data column (values as the engine cleaned them):
 | `dq.round_result` | round of a run: its summary (JSON) |
 | `silver.<dataset>` | record of the clean data: valid + resolved, per run |
 | `dq.merge_result` | run: counts and checks of its latest merge |
-| `metrics.*` | views, see [Data quality metrics](#data-quality-metrics) |
+| `semantic.dq_*` | DQ tables built from these by dbt, see [Data quality metrics](#data-quality-metrics) |
 
 Each step writes its tables in one transaction, so a step that fails
 leaves nothing half written. Older database volumes get any missing
@@ -201,7 +209,6 @@ psql -U postgres -c "CREATE DATABASE metaflow OWNER metaflow"
 psql -U metaflow -d metaflow -f sql/01_bronze.sql
 psql -U metaflow -d metaflow -f sql/02_dq.sql
 psql -U metaflow -d metaflow -f sql/03_meta_gold.sql
-psql -U metaflow -d metaflow -f sql/04_metrics.sql
 ```
 
 The scripts connect with `POSTGRES_HOST`, `POSTGRES_PORT`, `POSTGRES_DB`,
@@ -267,7 +274,7 @@ python dq.py status
 #    upserted by primary key (initial or incremental load, see below)
 python dq.py merge
 
-# 8. Data-quality metric views for Power BI (metrics schema, all runs)
+# 8. DQ tables of the semantic layer (dbt: semantic.dq_*, all runs) and their checks
 python dq.py metrics
 
 # 9. Describe silver in the meta schema
@@ -276,7 +283,14 @@ python dq.py metadata
 # 10. Build the gold star schema from the metadata
 python dq.py gold
 
-# Steps 1, 2, 3-4 and 7-10 in one go
+# 11. Business and DQ metrics of the semantic layer (dbt + MetricFlow),
+#     stored in semantic.metric_definition / metric_value
+python dq.py semantic
+
+# 12. Refresh the Power BI semantic model (skipped when POWERBI_* is not set)
+python dq.py powerbi-refresh
+
+# Steps 1, 2, 3-4 and 7-12 in one go
 python dq.py pipeline --input data/raw/banking/banking_transactions.csv
 ```
 
@@ -397,9 +411,9 @@ service.
 
 | DAG | Tasks | When |
 |---|---|---|
-| `dq_ingest_validate` | ingest, profile, validate, merge, metrics, metadata, gold | a new file; param `input` |
-| `dq_apply_corrections` | import-corrections, revalidate, merge, metrics, metadata, gold | a file sent from the correction UI's upload page (automatic), or by hand; params `run`, `file`, `user`; one run at a time |
-| `dq_publish` | merge, metrics, metadata, gold | every day at 18:00 (records fixed in the UI) |
+| `dq_ingest_validate` | ingest, profile, validate, merge, metrics, metadata, gold, semantic, powerbi | a new file; param `input` |
+| `dq_apply_corrections` | import-corrections, revalidate, merge, metrics, metadata, gold, semantic, powerbi | a file sent from the correction UI's upload page (automatic), or by hand; params `run`, `file`, `user`; one run at a time |
+| `dq_publish` | merge, metrics, metadata, gold, semantic, powerbi | every day at 18:00 (records fixed in the UI) |
 
 With Docker (above), Airflow is at http://localhost:8080 and its tasks
 send their Spark jobs to the `spark-master` service. The DAGs use the same
@@ -407,6 +421,58 @@ database as the commands and the UI. The pipeline runs in its own virtual
 environment inside the image. Elsewhere, Airflow workers need
 `METAFLOW_HOME` (the project folder), `METAFLOW_PYTHON` (a Python with the
 requirements above), Java 17 and the `POSTGRES_*` variables.
+
+## Power BI
+
+Every Airflow run ends with the data Power BI reads in PostgreSQL: the
+`semantic` task stores the business and DQ metrics, and the `powerbi`
+task then refreshes the Power BI semantic model, so the reports show a
+run's data as soon as it ends, without anyone pressing Refresh.
+
+```
+Airflow: ... -> metrics -> metadata -> gold -> semantic -> powerbi
+                   |                    |          |          |
+PostgreSQL:   semantic.dq_*        gold.*    semantic.metric_*|
+                   \____________________|__________/          |
+Power BI:              semantic model  <---- refresh ---------/
+```
+
+### Connect
+
+Power BI Desktop: **Get data -> PostgreSQL database**, server
+`localhost:5432` (Docker publishes it), database `metaflow`, user and
+password from `.env`. Load:
+
+| Table / view | For |
+|---|---|
+| `semantic.metric_report` | every metric and measure with its label, unit and area: business (`grain` month or total) and data quality (`area = 'Data Quality'`; month, total, or per run with `run_id`) |
+| `semantic.dq_run`, `dq_rule_result`, `dq_quarantine`, `dq_correction` | DQ detail: rounds, rules, quarantined records, corrections |
+| `gold.fact_transaction`, `gold.dim_*` | to slice the measures by channel, segment, branch...: the same measures in DAX in [`semantic/`](semantic/README.md) |
+
+### Refresh automatically
+
+- **Published to the Power BI Service** (scheduled reports, sharing):
+  1. Install an [on-premises data gateway](https://learn.microsoft.com/power-bi/connect-data/service-gateway-onprem)
+     on a machine that reaches the database, and add the PostgreSQL data
+     source to it (same server, database and login as above).
+  2. Publish the report; in the semantic model's settings, map it to that
+     gateway data source.
+  3. Register an app in Microsoft Entra ID (a service principal) with a
+     client secret; in the Power BI admin portal allow service principals
+     to use the Power BI APIs; add the app to the workspace as Member.
+  4. Put its settings in `.env` (see `.env.example`):
+     `POWERBI_TENANT_ID`, `POWERBI_CLIENT_ID`, `POWERBI_CLIENT_SECRET`,
+     `POWERBI_WORKSPACE_ID`, `POWERBI_DATASET_ID` (the IDs are in the
+     semantic model's URL: `/groups/<workspace>/datasets/<dataset>`).
+
+  From then on the `powerbi` task of every DAG starts a refresh through
+  the Power BI REST API and waits for it (`POWERBI_REFRESH_TIMEOUT`,
+  default 1800 s); a failed refresh fails the task. Without these
+  settings the task is skipped (exit code 99) and everything else runs
+  as before.
+- **Power BI Desktop only**: choose **DirectQuery** when connecting;
+  every page then reads PostgreSQL as it is, so it shows the latest run
+  with no refresh at all. (Import mode needs **Refresh** after a run.)
 
 ## Tests and CI
 
@@ -462,28 +528,30 @@ Environment variables (in `.env` or the environment):
 
 ## Data quality metrics
 
-Four views in the `metrics` schema (`sql/04_metrics.sql`) read the `dq`
-schema directly, so they always cover every run. `python dq.py metrics`
-creates them again from that file (so a change there reaches the
-database) and checks them: one row per run and round, one latest round
-per run, quarantined = resolved + discarded + unresolved, known statuses
-and outcomes. Connect Power BI to them:
+Everything about data quality is in the semantic layer, in the
+`semantic` schema: four DQ tables, and the DQ metrics (scores, rates, the
+record funnel) computed from them next to the business metrics (see
+[Semantic layer](#semantic-layer-dbt--metricflow)).
 
-| View | One row per |
+`python dq.py metrics` loads the four tables with dbt (`dbt build --select
+tag:dq`: `dbt/models/dq`) from what the DQ engine recorded in the `dq`
+schema, for every run, and runs their tests: one row per run and round,
+one latest round per run, quarantined = resolved + discarded + unresolved,
+known statuses and outcomes (an unknown outcome is a warning). A failing
+test fails the step. The first run also drops the `metrics` views of
+earlier versions. Power BI reads them for record-level detail:
+
+| Table | One row per |
 |---|---|
 | `dq_run` | run and round: processed, valid, auto-fixed, quarantined, resolved, manually fixed, confirmed after review, discarded, unresolved, DQ scores |
 | `dq_rule_result` | run, round and rule: checked, failed, repaired, unresolved |
 | `dq_quarantine` | status change of a quarantined record |
 | `dq_correction` | automatic repair or manual correction, with its outcome |
 
-- initial DQ score = valid / processed
-- final DQ score = (valid + resolved) / processed
-- records with issues = auto-fixed + quarantined; the quarantined ones end
-  up manually fixed, confirmed after review, resolved otherwise,
-  discarded or unresolved
-
-The latest round of a run gives the funnel directly, e.g. 350 with
-issues -> 200 auto-fixed -> 130 manually fixed -> 20 unresolved
+Records with issues = auto-fixed + quarantined; the quarantined ones end
+up manually fixed, confirmed after review, resolved otherwise, discarded
+or unresolved. The latest round of a run gives the funnel directly, e.g.
+350 with issues -> 200 auto-fixed -> 130 manually fixed -> 20 unresolved
 (`is_latest_round` marks it).
 
 ### Business data
@@ -494,21 +562,116 @@ Power BI reads the gold star schema directly: `gold.fact_transaction`,
 `python dq.py gold` replaces them in one transaction, so a refresh never
 sees a half-built star; their columns follow the metadata.
 
-### Metric definitions
+### Semantic layer (dbt + MetricFlow)
 
-The semantic layer is the Power BI semantic model: relationships and DAX
-measures over the views and gold tables above. Define the measures as
-follows, ratios as sum / sum (never an average of a ratio column):
+The semantic layer is one dbt project (`dbt/`) and one PostgreSQL schema,
+`semantic`. Every measure and metric, business and data quality, is
+defined once, in `dbt/models/semantic/_metrics.yml` (MetricFlow), and
+stored by `python dq.py semantic` (after `metrics` and `gold`, as in the
+DAGs):
 
-| Metric | Definition |
+| In `semantic` | What | Built by |
+|---|---|---|
+| `dq_run`, `dq_rule_result`, `dq_quarantine`, `dq_correction` | DQ tables | `dq.py metrics` (dbt, `tag:dq`) |
+| `fct_transactions`, `dim_customers`, `dim_branches`, `dim_banks` | gold as MetricFlow reads it (fee in EGP, status flags; no personal data) | `dq.py semantic` (dbt) |
+| `dq_runs`, `dq_rule_checks` | the DQ tables as MetricFlow reads them | `dq.py semantic` (dbt) |
+| `metricflow_time_spine` | one row per day | `dq.py semantic` (dbt) |
+| `metric_definition`, `metric_value`, `metric_report` | every metric: definition and values | `dq.py semantic` (MetricFlow) |
+
+1. `dbt build` builds the views and the time spine and runs the tests.
+2. `mf query` computes every metric per month and in total, and the DQ
+   metrics per run too. Prior-year, month-on-month, year-to-date and
+   rolling 12-month metrics are stored per month only.
+3. One transaction replaces the stored metrics:
+
+| Table | One row per |
 |---|---|
-| DQ initial score, DQ final score | valid / processed, (valid + resolved) / processed |
-| DQ auto-fix rate, DQ resolution rate | auto-fixed / records with issues, resolved / quarantined |
-| Rule failure rate, rule repair rate | failed / checked, repaired / failed (per rule, dimension, severity) |
-| Record funnel and corrections | counts of `dq_run` and `dq_correction` |
-| Transactions, amount (EGP), average transaction (EGP) | count, sum and average of the transactions |
-| Failure rate, digital share, cost per transaction (EGP) | failed / all, digital channel / all, channel cost / transaction |
-| Active customers, digital migration opportunities | distinct customers, flagged transactions |
+| `semantic.metric_definition` | metric: label, description, type, formula, unit, area, headline |
+| `semantic.metric_value` | metric, grain (`month`, `total` or `run`) and period (month, or the run's day with its `run_id`): its value |
+| `semantic.metric_report` (view) | value with its label, unit and area: what Power BI reads |
 
-The run-level DQ measures read the latest round of each run only
-(`dq_run[is_latest_round] = TRUE`).
+Ratios are sum / sum, never an average of a ratio column, so they stay
+right across months, runs and any other grouping.
+
+#### Data quality metrics
+
+The 10 headline DQ metrics (area `Data Quality`). Each run counts with its
+current figures (after every correction round so far), and a run belongs
+to the month its file was ingested:
+
+| Metric | Definition | Answers |
+|---|---|---|
+| `processed_records` | records validated (input minus exact duplicates) | How much data was checked? |
+| `initial_dq_score` | valid / processed | How good is the data as it arrives? |
+| `final_dq_score` | (valid + resolved) / processed | How good is it after the corrections? |
+| `dq_score_uplift` | final - initial DQ score | What did the corrections add? |
+| `records_with_issues` | auto-fixed + quarantined | How many records had a problem? |
+| `auto_fix_rate` | auto-fixed / records with issues | How much is fixed with no person involved? |
+| `resolution_rate` | resolved / quarantined | How much of the quarantine gets resolved? |
+| `unresolved_records` | quarantined, still open or waiting for an expert | What is still blocked? |
+| `rule_failure_rate` | failed / checked values (first validation) | How often do values break a rule? |
+| `rule_repair_rate` | repaired / failed values | How many of those are repaired automatically? |
+
+They are built from helper metrics, stored too (`headline = false`):
+validated runs; valid, clean, auto-fixed, quarantined, resolved, manually
+fixed, confirmed and discarded records; the quarantine rate; values
+checked, failed and repaired. Ad hoc, by rule, DQ dimension or severity
+(inside `dbt/`):
+
+```bash
+mf query --metrics final_dq_score,auto_fix_rate --group-by dq_run__run_id
+mf query --metrics rule_failure_rate,rule_repair_rate --group-by rule_check__dq_dimension
+mf query --metrics values_failed --group-by rule_check__rule_id,rule_check__severity
+```
+
+```sql
+SELECT run_id, run_date, label, value FROM semantic.metric_report
+WHERE area = 'Data Quality' AND headline AND grain = 'run' ORDER BY run_date, label;
+```
+
+#### Business metrics
+
+Every Power BI measure of `semantic/fact_transaction_measures.dax` is a
+metric here too, with the same name in snake case (e.g. `Digital Share
+%` is `digital_share`, `Transactions MoM %` is `transactions_mom_growth`):
+volume and value, revenue, channel cost, digital adoption, migration
+opportunity, reliability, customers, payments and network, trends and data
+freshness (dates and run ids as numbers: `20261013`, `20261013001`). Only
+`Failure Reason Share %` stays in Power BI: it is a share of the failures
+in the visual's own failure-reason filter. The 15 headline business
+metrics, with the question each answers:
+
+| Area | Metric | Definition | Answers |
+|---|---|---|---|
+| Volume & Value | `transactions` | count of transactions | How much activity is there? |
+| | `transaction_value_egp` | completed amount in EGP | How much money moves through the bank? |
+| | `avg_transaction_value_egp` | value / completed transactions | How big is a typical transaction? |
+| | `transaction_value_egp_yoy_growth` | value against a year earlier | Is the business growing? |
+| Revenue & Cost | `fee_revenue_egp` | fees of completed transactions, in EGP | What do transactions earn? |
+| | `channel_cost_egp` | estimated cost of serving the transactions | What do they cost? |
+| | `cost_per_transaction_egp` | channel cost / transactions | How efficient is each transaction? |
+| | `fee_coverage_of_channel_cost` | fee revenue / channel cost | Do fees pay for serving transactions? |
+| Digital Adoption | `digital_share` | digital transactions / transactions | How far has volume moved to digital? |
+| | `digital_adoption_rate` | digitally active / active customers | How many customers use digital? |
+| Customers | `active_customers` | distinct customers | How many customers transact? |
+| Migration Opportunity | `migration_opportunities` | transfers, bill payments, loan repayments at ATM, branch, call center | How much could go digital? |
+| | `potential_cost_savings_egp` | opportunity cost - opportunities x digital cost per transaction | What would moving them save? |
+| Reliability | `failure_rate` | failed / transactions | How reliable is the service? |
+| | `failed_value_egp` | amount of the failed transactions | How much business is lost or delayed? |
+
+They are built from 7 helper metrics, stored too (`headline = false`):
+completed, digital and failed transactions, digitally active customers,
+migration opportunity cost, digital channel cost and digital cost per
+transaction. The DAX measures in `semantic/` give the same numbers in
+Power BI for any slice (channel, segment, branch...), with a SQL check of
+the headline numbers. Ad hoc questions (inside `dbt/`):
+
+```bash
+mf query --metrics digital_share,potential_cost_savings_egp --group-by metric_time__month
+mf query --metrics digital_adoption_rate --group-by customer__customer_segment
+```
+
+```sql
+SELECT area, label, month, value FROM semantic.metric_report
+WHERE headline AND grain = 'month' ORDER BY area, label, month;
+```

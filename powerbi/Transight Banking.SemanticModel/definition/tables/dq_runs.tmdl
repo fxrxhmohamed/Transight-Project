@@ -1,0 +1,258 @@
+/// semantic.dq_runs: one row per validated run, figures of its latest correction round.
+table dq_runs
+	lineageTag: 101f7f8e-c6e1-52cd-bc6e-c8f1d2a3018d
+
+	/// validated_runs: count(run_id)
+	measure 'Validated Runs' = DISTINCTCOUNT ( 'dq_runs'[run_id] )
+		formatString: #,0
+		displayFolder: DQ Records
+		lineageTag: db0036a8-0a45-5947-bacd-471af0c85f71
+
+	/// processed_records: sum(processed)
+	measure 'Processed Records' = SUM ( 'dq_runs'[processed] )
+		formatString: #,0
+		displayFolder: DQ Records
+		lineageTag: 748015fa-455b-5321-a30f-a27bf9b96cf4
+
+	/// valid_records: sum(valid)
+	measure 'Valid Records' = SUM ( 'dq_runs'[valid] )
+		formatString: #,0
+		displayFolder: DQ Records
+		lineageTag: 0c128f1b-f67b-5109-9ffc-4173bde589a5
+
+	/// clean_records: sum(clean_records) = valid + resolved
+	measure 'Clean Records' = SUM ( 'dq_runs'[clean_records] )
+		formatString: #,0
+		displayFolder: DQ Records
+		lineageTag: 44e39d7e-76a7-5da1-89e8-23cf2c504d59
+
+	/// records_with_issues: sum(records_with_issues)
+	measure 'Records with Issues' = SUM ( 'dq_runs'[records_with_issues] )
+		formatString: #,0
+		displayFolder: DQ Records
+		lineageTag: 5f04dbdc-91e5-51cf-a24a-738680c78b58
+
+	/// auto_fixed_records: sum(auto_fixed_records)
+	measure 'Auto-Fixed Records' = SUM ( 'dq_runs'[auto_fixed_records] )
+		formatString: #,0
+		displayFolder: DQ Records
+		lineageTag: 517040a6-28d2-57f6-976e-171b2c3f1e1f
+
+	/// quarantined_records: sum(quarantined)
+	measure 'Quarantined Records' = SUM ( 'dq_runs'[quarantined] )
+		formatString: #,0
+		displayFolder: DQ Records
+		lineageTag: 5c31e59e-7436-567d-9f3d-4e1b7bff8b4c
+
+	/// resolved_records: sum(resolved)
+	measure 'Resolved Records' = SUM ( 'dq_runs'[resolved] )
+		formatString: #,0
+		displayFolder: DQ Records
+		lineageTag: 7ce47dd7-2c17-5353-8a82-9fd80f8feeca
+
+	/// unresolved_records: sum(unresolved_records)
+	measure 'Unresolved Records' = SUM ( 'dq_runs'[unresolved_records] )
+		formatString: #,0
+		displayFolder: DQ Records
+		lineageTag: 219d2637-ba5a-539f-8d1a-62343b5096c8
+
+	/// manually_fixed_records: sum(manually_fixed_records)
+	measure 'Manually Fixed Records' = SUM ( 'dq_runs'[manually_fixed_records] )
+		formatString: #,0
+		displayFolder: DQ Records
+		lineageTag: bf8ed0f6-c72e-51e9-b8ae-e631d6322b36
+
+	/// discarded_records: sum(discarded)
+	measure 'Discarded Records' = SUM ( 'dq_runs'[discarded] )
+		formatString: #,0
+		displayFolder: DQ Records
+		lineageTag: 9c8614c7-ae48-59cc-b026-0df314c6cc74
+
+	/// initial_dq_score: valid_records / processed_records
+	measure 'Initial DQ Score %' = DIVIDE ( [Valid Records], [Processed Records] )
+		formatString: 0.00%
+		displayFolder: DQ Scores
+		lineageTag: c3d5b349-b63d-5191-81ab-e11063c64b4b
+
+	/// final_dq_score: clean_records / processed_records
+	measure 'Final DQ Score %' = DIVIDE ( [Clean Records], [Processed Records] )
+		formatString: 0.00%
+		displayFolder: DQ Scores
+		lineageTag: 340a97ee-ffec-5f46-852c-c518f81199f5
+
+	/// dq_score_uplift: final_dq_score - initial_dq_score (percentage points)
+	measure 'DQ Score Uplift (pp)' = [Final DQ Score %] - [Initial DQ Score %]
+		formatString: +0.0000%;-0.0000%;0.0000%
+		displayFolder: DQ Scores
+		lineageTag: 0714dfe8-8130-599f-bc6d-4426f3573ace
+
+	/// auto_fix_rate: auto_fixed_records / records_with_issues
+	measure 'Auto-Fix Rate %' = DIVIDE ( [Auto-Fixed Records], [Records with Issues] )
+		formatString: 0.0%
+		displayFolder: DQ Scores
+		lineageTag: 7da40383-b2f9-53f9-85e4-556257a530ab
+
+	/// quarantine_rate: quarantined_records / processed_records
+	measure 'Quarantine Rate %' = DIVIDE ( [Quarantined Records], [Processed Records] )
+		formatString: 0.00%
+		displayFolder: DQ Scores
+		lineageTag: bcd7cc01-f30f-560e-b342-6409e4aa577b
+
+	/// resolution_rate: resolved_records / quarantined_records
+	measure 'Quarantine Resolution Rate %' = DIVIDE ( [Resolved Records], [Quarantined Records] )
+		formatString: 0.000%
+		displayFolder: DQ Scores
+		lineageTag: 5deaee4e-b432-5e09-b1fe-621b5a4fda95
+
+	column run_id
+		dataType: string
+		lineageTag: 7b76d7bd-1549-5a6c-94d0-4d19544b23d8
+		summarizeBy: none
+		sourceColumn: run_id
+
+	column dataset
+		dataType: string
+		lineageTag: e00e4e18-9416-58ee-b172-282389f35a3d
+		summarizeBy: none
+		sourceColumn: dataset
+
+	column source_file
+		dataType: string
+		lineageTag: 92c59387-96da-5f39-8c2d-c3f2943b36cc
+		summarizeBy: none
+		sourceColumn: source_file
+
+	column run_date
+		dataType: dateTime
+		formatString: yyyy-mm-dd
+		lineageTag: bb7ad39d-56c3-5fc6-ab53-24fad37cd4e7
+		summarizeBy: none
+		sourceColumn: run_date
+
+		annotation UnderlyingDateTimeDataType = Date
+
+	column schema_version
+		dataType: string
+		lineageTag: 5d48b570-df51-5638-b9db-e89c69c05fd8
+		summarizeBy: none
+		sourceColumn: schema_version
+
+	column rules_version
+		dataType: string
+		lineageTag: e04bbc40-bdce-5c2d-b651-5c9850e91b9a
+		summarizeBy: none
+		sourceColumn: rules_version
+
+	column rounds
+		dataType: int64
+		isHidden
+		formatString: #,0
+		lineageTag: 7d275664-8b5c-56fe-a690-37431e2bd4a5
+		summarizeBy: none
+		sourceColumn: rounds
+
+	column processed
+		dataType: int64
+		isHidden
+		formatString: #,0
+		lineageTag: 586dd67b-e981-5483-a842-9006f1e2ca40
+		summarizeBy: none
+		sourceColumn: processed
+
+	column valid
+		dataType: int64
+		isHidden
+		formatString: #,0
+		lineageTag: 25f1c847-03bd-5b8d-986d-b69f68ce4f9c
+		summarizeBy: none
+		sourceColumn: valid
+
+	column valid_with_warnings
+		dataType: int64
+		isHidden
+		formatString: #,0
+		lineageTag: d989f3b0-8d49-5682-80d5-ecba28c0702e
+		summarizeBy: none
+		sourceColumn: valid_with_warnings
+
+	column auto_fixed_records
+		dataType: int64
+		isHidden
+		formatString: #,0
+		lineageTag: ae51a655-0d27-589a-b582-97672e4653cb
+		summarizeBy: none
+		sourceColumn: auto_fixed_records
+
+	column quarantined
+		dataType: int64
+		isHidden
+		formatString: #,0
+		lineageTag: 0ea57a7e-22dd-5ce3-8c08-5b7212f6429b
+		summarizeBy: none
+		sourceColumn: quarantined
+
+	column records_with_issues
+		dataType: int64
+		isHidden
+		formatString: #,0
+		lineageTag: d08a8ed7-49c7-5f66-b9d5-5bbd276bd708
+		summarizeBy: none
+		sourceColumn: records_with_issues
+
+	column resolved
+		dataType: int64
+		isHidden
+		formatString: #,0
+		lineageTag: cea04277-aebe-5223-a27b-6e9bfd227468
+		summarizeBy: none
+		sourceColumn: resolved
+
+	column clean_records
+		dataType: int64
+		isHidden
+		formatString: #,0
+		lineageTag: 35634359-497c-5dea-91dd-99eb998ad90d
+		summarizeBy: none
+		sourceColumn: clean_records
+
+	column manually_fixed_records
+		dataType: int64
+		isHidden
+		formatString: #,0
+		lineageTag: 3c80d3c5-6c56-5ee9-a13a-1f1b21abf1e3
+		summarizeBy: none
+		sourceColumn: manually_fixed_records
+
+	column confirmed_records
+		dataType: int64
+		isHidden
+		formatString: #,0
+		lineageTag: f3aa740d-2894-56fc-a31e-7e1cb2662b81
+		summarizeBy: none
+		sourceColumn: confirmed_records
+
+	column discarded
+		dataType: int64
+		isHidden
+		formatString: #,0
+		lineageTag: cc56f397-a1f1-532e-920f-2ebee97b79ca
+		summarizeBy: none
+		sourceColumn: discarded
+
+	column unresolved_records
+		dataType: int64
+		isHidden
+		formatString: #,0
+		lineageTag: 8ec88ba3-3560-5ecf-8bef-d15edc50c28c
+		summarizeBy: none
+		sourceColumn: unresolved_records
+
+	partition dq_runs = m
+		mode: import
+		source =
+				let
+				    Source = PostgreSQL.Database(PgServer, PgDatabase),
+				    Data = Source{[Schema = "semantic", Item = "dq_runs"]}[Data]
+				in
+				    Data
+

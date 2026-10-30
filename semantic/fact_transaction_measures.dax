@@ -1,0 +1,467 @@
+// =====================================================================
+// Transight semantic layer: measures over gold.fact_transaction
+// =====================================================================
+//
+// How to load them (Power BI Desktop, DAX query view):
+//   1. Paste this file into a new DAX query tab.
+//   2. Click "Update model: Add new measures" above DEFINE (or per
+//      measure), then Run to see the headline numbers below EVALUATE.
+//   3. Set the display folder and format of each measure as noted in its
+//      section header (semantic/README.md lists them all).
+//
+// Model this file expects (tables named after the gold tables):
+//   fact_transaction[transaction_date]  -> dim_date[date_key]      (many-to-one)
+//   fact_transaction[customer_id]       -> dim_customer[customer_id]
+//   fact_transaction[account_id]        -> dim_account[account_id]
+//   fact_transaction[branch_id]         -> dim_branch[branch_id]
+//   fact_transaction[bank_id]           -> dim_bank[bank_id]
+//   dim_date marked as the date table (date column: date_key).
+//   Do not also relate dim_account -> dim_customer or dim_branch ->
+//   dim_bank: the fact table already carries those keys, and a second
+//   path would make the model ambiguous.
+//
+// Rules every measure follows
+//   - Money is summed in EGP only (amount_egp, estimated_channel_cost_egp).
+//     transaction_amount and transaction_fee are in the transaction's own
+//     currency (6% of rows are USD, EUR, SAR or AED) and are never summed
+//     as they are; fees are converted with the row's own rate.
+//   - "Value" means completed transactions; "attempted value" includes
+//     failed, pending and reversed ones.
+//   - Ratios are sum / sum (DIVIDE), never an average of row ratios.
+//   - balance_after_transaction is a point-in-time balance in the
+//     account's currency: it is not additive and has no measure here.
+// =====================================================================
+
+DEFINE
+
+    // -----------------------------------------------------------------
+    // 1. Volume and value                folder: 1 Volume & Value
+    //    formats: counts #,0 ; EGP #,0 ; rates 0.0%
+    //    Question: how much business goes through the bank?
+    // -----------------------------------------------------------------
+    MEASURE 'fact_transaction'[Transactions] =
+        COUNTROWS ( 'fact_transaction' )
+
+    MEASURE 'fact_transaction'[Completed Transactions] =
+        CALCULATE ( [Transactions], 'fact_transaction'[transaction_status] = "Completed" )
+
+    MEASURE 'fact_transaction'[Attempted Value (EGP)] =
+        SUM ( 'fact_transaction'[amount_egp] )
+
+    MEASURE 'fact_transaction'[Transaction Value (EGP)] =
+        CALCULATE ( [Attempted Value (EGP)], 'fact_transaction'[transaction_status] = "Completed" )
+
+    MEASURE 'fact_transaction'[Avg Transaction Value (EGP)] =
+        DIVIDE ( [Transaction Value (EGP)], [Completed Transactions] )
+
+    MEASURE 'fact_transaction'[Median Transaction Value (EGP)] =
+        CALCULATE (
+            MEDIAN ( 'fact_transaction'[amount_egp] ),
+            'fact_transaction'[transaction_status] = "Completed"
+        )
+
+    // Money into customers' accounts vs out of them. The data has no
+    // transfer direction: transfers count as outgoing.
+    MEASURE 'fact_transaction'[Inflow Value (EGP)] =
+        CALCULATE (
+            [Transaction Value (EGP)],
+            'fact_transaction'[transaction_type] IN { "Deposit", "Interest Credit" }
+        )
+
+    MEASURE 'fact_transaction'[Outflow Value (EGP)] =
+        CALCULATE (
+            [Transaction Value (EGP)],
+            'fact_transaction'[transaction_type]
+                IN { "Withdrawal", "Purchase", "Transfer", "Bill Payment", "Fee", "Loan Repayment" }
+        )
+
+    MEASURE 'fact_transaction'[Net Flow (EGP)] =
+        [Inflow Value (EGP)] - [Outflow Value (EGP)]
+
+    MEASURE 'fact_transaction'[Foreign Currency Value Share %] =
+        DIVIDE (
+            CALCULATE ( [Transaction Value (EGP)], 'fact_transaction'[currency] <> "EGP" ),
+            [Transaction Value (EGP)]
+        )
+
+    // -----------------------------------------------------------------
+    // 2. Fee revenue                     folder: 2 Revenue
+    //    Question: what do transactions earn, and does it cover their cost?
+    // -----------------------------------------------------------------
+    // Fees are in the transaction currency: converted with the row's rate
+    // (amount_egp / transaction_amount).
+    MEASURE 'fact_transaction'[Fee Revenue (EGP)] =
+        CALCULATE (
+            SUMX (
+                'fact_transaction',
+                'fact_transaction'[transaction_fee]
+                    * DIVIDE ( 'fact_transaction'[amount_egp], 'fact_transaction'[transaction_amount] )
+            ),
+            'fact_transaction'[transaction_status] = "Completed"
+        )
+
+    MEASURE 'fact_transaction'[Fee-Bearing Transactions] =
+        CALCULATE ( [Completed Transactions], 'fact_transaction'[transaction_fee] > 0 )
+
+    MEASURE 'fact_transaction'[Avg Fee per Fee-Bearing Transaction (EGP)] =
+        DIVIDE ( [Fee Revenue (EGP)], [Fee-Bearing Transactions] )
+
+    MEASURE 'fact_transaction'[Fee Yield %] =
+        DIVIDE (
+            [Fee Revenue (EGP)],
+            CALCULATE ( [Transaction Value (EGP)], 'fact_transaction'[transaction_fee] > 0 )
+        )
+
+    MEASURE 'fact_transaction'[Fee Coverage of Channel Cost %] =
+        DIVIDE ( [Fee Revenue (EGP)], [Channel Cost (EGP)] )
+
+    // -----------------------------------------------------------------
+    // 3. Channel cost                    folder: 3 Channel Cost
+    //    Question: what does serving transactions cost, per channel?
+    // -----------------------------------------------------------------
+    MEASURE 'fact_transaction'[Channel Cost (EGP)] =
+        SUM ( 'fact_transaction'[estimated_channel_cost_egp] )
+
+    MEASURE 'fact_transaction'[Cost per Transaction (EGP)] =
+        DIVIDE ( [Channel Cost (EGP)], [Transactions] )
+
+    MEASURE 'fact_transaction'[Cost per 1K EGP Processed] =
+        DIVIDE ( [Channel Cost (EGP)], [Transaction Value (EGP)] ) * 1000
+
+    // Benchmarks, independent of the channel filters on the visual (other
+    // filters such as date, type or segment still apply).
+    MEASURE 'fact_transaction'[Digital Cost per Transaction (EGP)] =
+        CALCULATE (
+            [Cost per Transaction (EGP)],
+            REMOVEFILTERS (
+                'fact_transaction'[channel], 'fact_transaction'[channel_feature],
+                'fact_transaction'[digital_feature_use], 'fact_transaction'[card_type],
+                'fact_transaction'[digital_migration_opportunity]
+            ),
+            'fact_transaction'[digital_channel_flag] = TRUE ()
+        )
+
+    MEASURE 'fact_transaction'[Assisted Cost per Transaction (EGP)] =
+        CALCULATE (
+            [Cost per Transaction (EGP)],
+            REMOVEFILTERS (
+                'fact_transaction'[channel], 'fact_transaction'[channel_feature],
+                'fact_transaction'[digital_feature_use], 'fact_transaction'[card_type],
+                'fact_transaction'[digital_migration_opportunity]
+            ),
+            'fact_transaction'[digital_channel_flag] = FALSE ()
+        )
+
+    MEASURE 'fact_transaction'[Assisted vs Digital Cost Multiple] =
+        DIVIDE ( [Assisted Cost per Transaction (EGP)], [Digital Cost per Transaction (EGP)] )
+
+    MEASURE 'fact_transaction'[Cost of Failed Transactions (EGP)] =
+        CALCULATE ( [Channel Cost (EGP)], 'fact_transaction'[transaction_status] = "Failed" )
+
+    // -----------------------------------------------------------------
+    // 4. Digital adoption                folder: 4 Digital Adoption
+    //    Question: how far has the bank moved its customers to digital?
+    // -----------------------------------------------------------------
+    MEASURE 'fact_transaction'[Digital Transactions] =
+        CALCULATE ( [Transactions], 'fact_transaction'[digital_channel_flag] = TRUE () )
+
+    MEASURE 'fact_transaction'[Assisted Transactions] =
+        CALCULATE ( [Transactions], 'fact_transaction'[digital_channel_flag] = FALSE () )
+
+    MEASURE 'fact_transaction'[Digital Share %] =
+        DIVIDE ( [Digital Transactions], [Transactions] )
+
+    MEASURE 'fact_transaction'[Digital Value (EGP)] =
+        CALCULATE ( [Transaction Value (EGP)], 'fact_transaction'[digital_channel_flag] = TRUE () )
+
+    MEASURE 'fact_transaction'[Digital Value Share %] =
+        DIVIDE ( [Digital Value (EGP)], [Transaction Value (EGP)] )
+
+    MEASURE 'fact_transaction'[Digitally Active Customers] =
+        CALCULATE ( [Active Customers], 'fact_transaction'[digital_channel_flag] = TRUE () )
+
+    MEASURE 'fact_transaction'[Digital Adoption Rate %] =
+        DIVIDE ( [Digitally Active Customers], [Active Customers] )
+
+    // Customers who never used a digital channel in the selection: the
+    // first audience for digital onboarding campaigns.
+    MEASURE 'fact_transaction'[Assisted-Only Customers] =
+        VAR AllCustomers = VALUES ( 'fact_transaction'[customer_id] )
+        VAR DigitalCustomers =
+            CALCULATETABLE (
+                VALUES ( 'fact_transaction'[customer_id] ),
+                'fact_transaction'[digital_channel_flag] = TRUE ()
+            )
+        RETURN
+            COUNTROWS ( EXCEPT ( AllCustomers, DigitalCustomers ) )
+
+    MEASURE 'fact_transaction'[Digital Login Success Rate %] =
+        DIVIDE (
+            CALCULATE ( [Digital Transactions], 'fact_transaction'[login_success] = TRUE () ),
+            CALCULATE ( [Digital Transactions], NOT ISBLANK ( 'fact_transaction'[login_success] ) )
+        )
+
+    MEASURE 'fact_transaction'[Avg Digital Session (min)] =
+        DIVIDE (
+            CALCULATE (
+                AVERAGE ( 'fact_transaction'[session_duration_seconds] ),
+                'fact_transaction'[digital_channel_flag] = TRUE ()
+            ),
+            60
+        )
+
+    // -----------------------------------------------------------------
+    // 5. Digital migration opportunity   folder: 5 Migration Opportunity
+    //    Question: which assisted transactions could go digital, and what
+    //    would the bank save?
+    //    (digital_migration_opportunity: Transfer, Bill Payment or Loan
+    //    Repayment made at an ATM, Branch or Call Center)
+    // -----------------------------------------------------------------
+    MEASURE 'fact_transaction'[Migration Opportunities] =
+        CALCULATE ( [Transactions], 'fact_transaction'[digital_migration_opportunity] = TRUE () )
+
+    MEASURE 'fact_transaction'[Migration Opportunity Rate %] =
+        DIVIDE ( [Migration Opportunities], [Assisted Transactions] )
+
+    MEASURE 'fact_transaction'[Migration Opportunity Value (EGP)] =
+        CALCULATE (
+            [Transaction Value (EGP)],
+            'fact_transaction'[digital_migration_opportunity] = TRUE ()
+        )
+
+    MEASURE 'fact_transaction'[Customers with Migration Opportunity] =
+        CALCULATE ( [Active Customers], 'fact_transaction'[digital_migration_opportunity] = TRUE () )
+
+    MEASURE 'fact_transaction'[Migration Opportunity Cost (EGP)] =
+        CALCULATE (
+            [Channel Cost (EGP)],
+            'fact_transaction'[digital_migration_opportunity] = TRUE ()
+        )
+
+    // What the opportunities cost today minus what they would cost on
+    // digital channels (at the digital cost per transaction).
+    MEASURE 'fact_transaction'[Potential Cost Savings (EGP)] =
+        MAX (
+            0,
+            [Migration Opportunity Cost (EGP)]
+                - [Migration Opportunities] * [Digital Cost per Transaction (EGP)]
+        )
+
+    MEASURE 'fact_transaction'[Potential Savings % of Channel Cost] =
+        DIVIDE ( [Potential Cost Savings (EGP)], [Channel Cost (EGP)] )
+
+    MEASURE 'fact_transaction'[Savings per Migrated Customer (EGP)] =
+        DIVIDE ( [Potential Cost Savings (EGP)], [Customers with Migration Opportunity] )
+
+    // Digital share once every opportunity has moved: the target state.
+    MEASURE 'fact_transaction'[Digital Share if Migrated %] =
+        DIVIDE ( [Digital Transactions] + [Migration Opportunities], [Transactions] )
+
+    // -----------------------------------------------------------------
+    // 6. Reliability                     folder: 6 Reliability
+    //    Question: how often do transactions fail, why, and what is lost?
+    // -----------------------------------------------------------------
+    MEASURE 'fact_transaction'[Failed Transactions] =
+        CALCULATE ( [Transactions], 'fact_transaction'[transaction_status] = "Failed" )
+
+    MEASURE 'fact_transaction'[Reversed Transactions] =
+        CALCULATE ( [Transactions], 'fact_transaction'[transaction_status] = "Reversed" )
+
+    MEASURE 'fact_transaction'[Pending Transactions] =
+        CALCULATE ( [Transactions], 'fact_transaction'[transaction_status] = "Pending" )
+
+    MEASURE 'fact_transaction'[Success Rate %] =
+        DIVIDE ( [Completed Transactions], [Transactions] )
+
+    MEASURE 'fact_transaction'[Failure Rate %] =
+        DIVIDE ( [Failed Transactions], [Transactions] )
+
+    MEASURE 'fact_transaction'[Reversal Rate %] =
+        DIVIDE ( [Reversed Transactions], [Transactions] )
+
+    MEASURE 'fact_transaction'[Pending Rate %] =
+        DIVIDE ( [Pending Transactions], [Transactions] )
+
+    MEASURE 'fact_transaction'[Failed Value (EGP)] =
+        CALCULATE ( [Attempted Value (EGP)], 'fact_transaction'[transaction_status] = "Failed" )
+
+    // Each reason's part of the failures (put failure_reason on the axis).
+    MEASURE 'fact_transaction'[Failure Reason Share %] =
+        DIVIDE (
+            [Failed Transactions],
+            CALCULATE ( [Failed Transactions], REMOVEFILTERS ( 'fact_transaction'[failure_reason] ) )
+        )
+
+    // Failures the bank can fix (its systems) vs the customer's side.
+    MEASURE 'fact_transaction'[Technical Failure Rate %] =
+        DIVIDE (
+            CALCULATE ( [Failed Transactions], 'fact_transaction'[failure_reason] = "Network Timeout" ),
+            [Transactions]
+        )
+
+    MEASURE 'fact_transaction'[Authentication Failure Rate %] =
+        DIVIDE (
+            CALCULATE ( [Failed Transactions], 'fact_transaction'[failure_reason] = "Authentication Failed" ),
+            [Transactions]
+        )
+
+    MEASURE 'fact_transaction'[Insufficient Funds Rate %] =
+        DIVIDE (
+            CALCULATE ( [Failed Transactions], 'fact_transaction'[failure_reason] = "Insufficient Funds" ),
+            [Transactions]
+        )
+
+    MEASURE 'fact_transaction'[Avg Attempts per Transaction] =
+        AVERAGE ( 'fact_transaction'[attempt_count] )
+
+    MEASURE 'fact_transaction'[Retried Transactions %] =
+        DIVIDE ( CALCULATE ( [Transactions], 'fact_transaction'[attempt_count] > 1 ), [Transactions] )
+
+    MEASURE 'fact_transaction'[First-Attempt Success Rate %] =
+        DIVIDE (
+            CALCULATE (
+                [Transactions],
+                'fact_transaction'[attempt_count] = 1,
+                'fact_transaction'[transaction_status] = "Completed"
+            ),
+            [Transactions]
+        )
+
+    // -----------------------------------------------------------------
+    // 7. Customers and engagement        folder: 7 Customers
+    //    Question: who transacts, how often and for how much?
+    // -----------------------------------------------------------------
+    MEASURE 'fact_transaction'[Active Customers] =
+        DISTINCTCOUNTNOBLANK ( 'fact_transaction'[customer_id] )
+
+    MEASURE 'fact_transaction'[Active Accounts] =
+        DISTINCTCOUNTNOBLANK ( 'fact_transaction'[account_id] )
+
+    MEASURE 'fact_transaction'[Transactions per Customer] =
+        DIVIDE ( [Transactions], [Active Customers] )
+
+    MEASURE 'fact_transaction'[Value per Customer (EGP)] =
+        DIVIDE ( [Transaction Value (EGP)], [Active Customers] )
+
+    MEASURE 'fact_transaction'[Fee Revenue per Customer (EGP)] =
+        DIVIDE ( [Fee Revenue (EGP)], [Active Customers] )
+
+    MEASURE 'fact_transaction'[Channel Cost per Customer (EGP)] =
+        DIVIDE ( [Channel Cost (EGP)], [Active Customers] )
+
+    // -----------------------------------------------------------------
+    // 8. Payments and network            folder: 8 Payments & Network
+    //    Question: where is money spent, and which cards and branches carry it?
+    // -----------------------------------------------------------------
+    MEASURE 'fact_transaction'[Purchase Value (EGP)] =
+        CALCULATE ( [Transaction Value (EGP)], 'fact_transaction'[transaction_type] = "Purchase" )
+
+    MEASURE 'fact_transaction'[Avg Purchase Ticket (EGP)] =
+        DIVIDE (
+            [Purchase Value (EGP)],
+            CALCULATE ( [Completed Transactions], 'fact_transaction'[transaction_type] = "Purchase" )
+        )
+
+    MEASURE 'fact_transaction'[Bill Payment Value (EGP)] =
+        CALCULATE ( [Transaction Value (EGP)], 'fact_transaction'[transaction_type] = "Bill Payment" )
+
+    MEASURE 'fact_transaction'[Active Merchants] =
+        DISTINCTCOUNTNOBLANK ( 'fact_transaction'[merchant_name] )
+
+    MEASURE 'fact_transaction'[Card Transactions] =
+        CALCULATE ( [Transactions], NOT ISBLANK ( 'fact_transaction'[card_type] ) )
+
+    MEASURE 'fact_transaction'[Card Share %] =
+        DIVIDE ( [Card Transactions], [Transactions] )
+
+    MEASURE 'fact_transaction'[Active Branches] =
+        DISTINCTCOUNTNOBLANK ( 'fact_transaction'[branch_id] )
+
+    MEASURE 'fact_transaction'[Transactions per Branch] =
+        DIVIDE ( [Transactions], [Active Branches] )
+
+    // -----------------------------------------------------------------
+    // 9. Trends                          folder: 9 Trends
+    //    Question: are we growing, and is digital adoption accelerating?
+    //    (need dim_date marked as the date table)
+    // -----------------------------------------------------------------
+    MEASURE 'fact_transaction'[Transaction Value YTD (EGP)] =
+        TOTALYTD ( [Transaction Value (EGP)], 'dim_date'[date_key] )
+
+    MEASURE 'fact_transaction'[Transaction Value PY (EGP)] =
+        CALCULATE ( [Transaction Value (EGP)], SAMEPERIODLASTYEAR ( 'dim_date'[date_key] ) )
+
+    MEASURE 'fact_transaction'[Transaction Value YoY %] =
+        DIVIDE (
+            [Transaction Value (EGP)] - [Transaction Value PY (EGP)],
+            [Transaction Value PY (EGP)]
+        )
+
+    MEASURE 'fact_transaction'[Transactions PY] =
+        CALCULATE ( [Transactions], SAMEPERIODLASTYEAR ( 'dim_date'[date_key] ) )
+
+    MEASURE 'fact_transaction'[Transactions YoY %] =
+        DIVIDE ( [Transactions] - [Transactions PY], [Transactions PY] )
+
+    MEASURE 'fact_transaction'[Transactions MoM %] =
+        VAR PreviousMonth =
+            CALCULATE ( [Transactions], DATEADD ( 'dim_date'[date_key], -1, MONTH ) )
+        RETURN
+            DIVIDE ( [Transactions] - PreviousMonth, PreviousMonth )
+
+    MEASURE 'fact_transaction'[Transaction Value R12M (EGP)] =
+        CALCULATE (
+            [Transaction Value (EGP)],
+            DATESINPERIOD ( 'dim_date'[date_key], MAX ( 'dim_date'[date_key] ), -12, MONTH )
+        )
+
+    MEASURE 'fact_transaction'[Digital Share PY %] =
+        CALCULATE ( [Digital Share %], SAMEPERIODLASTYEAR ( 'dim_date'[date_key] ) )
+
+    // Percentage points (format 0.0%: +0.052 shows as 5.2%).
+    MEASURE 'fact_transaction'[Digital Share YoY Change (pp)] =
+        IF (
+            NOT ISBLANK ( [Digital Share PY %] ),
+            [Digital Share %] - [Digital Share PY %]
+        )
+
+    MEASURE 'fact_transaction'[Active Customers PY] =
+        CALCULATE ( [Active Customers], SAMEPERIODLASTYEAR ( 'dim_date'[date_key] ) )
+
+    MEASURE 'fact_transaction'[Active Customers YoY %] =
+        DIVIDE ( [Active Customers] - [Active Customers PY], [Active Customers PY] )
+
+    MEASURE 'fact_transaction'[Channel Cost YoY %] =
+        VAR PriorYear =
+            CALCULATE ( [Channel Cost (EGP)], SAMEPERIODLASTYEAR ( 'dim_date'[date_key] ) )
+        RETURN
+            DIVIDE ( [Channel Cost (EGP)] - PriorYear, PriorYear )
+
+    // -----------------------------------------------------------------
+    // 10. Data freshness                 folder: 10 Data Freshness
+    //     Question: how current is what the report shows? (lineage of
+    //     the incremental loads; DQ scores are in semantic.metric_report)
+    // -----------------------------------------------------------------
+    MEASURE 'fact_transaction'[Latest Transaction Date] =
+        MAX ( 'fact_transaction'[transaction_date] )
+
+    MEASURE 'fact_transaction'[Load Runs in Data] =
+        DISTINCTCOUNT ( 'fact_transaction'[run_id] )
+
+    MEASURE 'fact_transaction'[Latest Load Run] =
+        MAX ( 'fact_transaction'[run_id] )
+
+// Headline numbers, to compare with semantic/measure_checks.sql.
+EVALUATE
+    ROW (
+        "Transactions", [Transactions],
+        "Transaction Value (EGP)", [Transaction Value (EGP)],
+        "Fee Revenue (EGP)", [Fee Revenue (EGP)],
+        "Channel Cost (EGP)", [Channel Cost (EGP)],
+        "Digital Share %", [Digital Share %],
+        "Digital Adoption Rate %", [Digital Adoption Rate %],
+        "Migration Opportunities", [Migration Opportunities],
+        "Potential Cost Savings (EGP)", [Potential Cost Savings (EGP)],
+        "Failure Rate %", [Failure Rate %],
+        "Active Customers", [Active Customers]
+    )

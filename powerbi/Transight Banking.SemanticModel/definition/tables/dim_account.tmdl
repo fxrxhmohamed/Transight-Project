@@ -1,0 +1,48 @@
+/// gold.dim_account.
+table dim_account
+	lineageTag: 9a76a6dd-78a1-5f56-8c96-075b9bc74b8b
+
+	column account_id
+		dataType: string
+		lineageTag: f9086700-8c31-5407-b6a5-c6e05cb1fdec
+		summarizeBy: none
+		sourceColumn: account_id
+
+	column account_type
+		dataType: string
+		lineageTag: cbd6c611-7b21-5751-9d64-881dfe43cfda
+		summarizeBy: none
+		sourceColumn: account_type
+
+	column account_open_date
+		dataType: dateTime
+		formatString: yyyy-mm-dd
+		lineageTag: 2b44033e-4ac1-5abc-a0ef-c95823e08dda
+		summarizeBy: none
+		sourceColumn: account_open_date
+
+		annotation UnderlyingDateTimeDataType = Date
+
+	column account_status
+		dataType: string
+		lineageTag: 216f6104-7ce3-5301-836f-8ba165d8e4da
+		summarizeBy: none
+		sourceColumn: account_status
+
+	column interest_rate
+		dataType: double
+		formatString: 0.00
+		lineageTag: f7112a70-12c2-58e7-a109-56fb1c732aaf
+		summarizeBy: none
+		sourceColumn: interest_rate
+
+	partition dim_account = m
+		mode: import
+		source =
+				let
+				    Source = PostgreSQL.Database(PgServer, PgDatabase),
+				    Data = Source{[Schema = "gold", Item = "dim_account"]}[Data],
+				    Selected = Table.SelectColumns(Data, {"account_id", "account_type", "account_open_date", "account_status", "interest_rate"})
+				in
+				    Selected
+

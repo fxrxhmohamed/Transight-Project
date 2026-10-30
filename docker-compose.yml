@@ -92,7 +92,11 @@ services:
       - "${UI_PORT:-8501}:8501"
     environment:
       <<: *database
-      SPARK_DRIVER_MEMORY: ${SPARK_DRIVER_MEMORY:-4g}
+      # Revalidation reads the whole valid dataset as context for the
+      # cross-row rules. local[*] would run one task per host core (20+),
+      # all sharing this heap: a few cores give each task room.
+      SPARK_MASTER: local[${UI_SPARK_CORES:-4}]
+      SPARK_DRIVER_MEMORY: ${UI_DRIVER_MEMORY:-4g}
       # An uploaded correction file triggers the dq_apply_corrections DAG
       # (airflow_trigger.py); the file is saved under data/corrections/.
       AIRFLOW_API_URL: http://airflow:8080
@@ -130,6 +134,14 @@ services:
       SPARK_MASTER: spark://spark-master:7077
       SPARK_DRIVER_HOST: airflow
       SPARK_DRIVER_MEMORY: 2g
+      # E-mail on every DAG run (airflow/dags/dq_notify.py), from .env.
+      DQ_ALERT_EMAIL: ${DQ_ALERT_EMAIL:-}
+      SMTP_HOST: ${SMTP_HOST:-smtp.gmail.com}
+      SMTP_PORT: ${SMTP_PORT:-587}
+      SMTP_USER: ${SMTP_USER:-}
+      SMTP_PASSWORD: ${SMTP_PASSWORD:-}
+      SMTP_FROM: ${SMTP_FROM:-}
+      AIRFLOW_UI_URL: http://localhost:8080
     depends_on:
       postgres:
         condition: service_healthy

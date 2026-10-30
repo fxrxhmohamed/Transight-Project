@@ -1,0 +1,31 @@
+/// gold.dim_bank.
+table dim_bank
+	lineageTag: 64ba07e8-9902-5aae-86f5-469ad92f0448
+
+	column bank_id
+		dataType: string
+		lineageTag: 5bf21c3d-a490-52d2-94a9-2e110a6a053b
+		summarizeBy: none
+		sourceColumn: bank_id
+
+	column bank_name
+		dataType: string
+		lineageTag: fc52f577-30e9-5208-9d67-9dc077831f98
+		summarizeBy: none
+		sourceColumn: bank_name
+
+	column bank_type
+		dataType: string
+		lineageTag: 3fd3d854-3fe3-5a27-a5c8-0b7bb4d26b53
+		summarizeBy: none
+		sourceColumn: bank_type
+
+	partition dim_bank = m
+		mode: import
+		source =
+				let
+				    Source = PostgreSQL.Database(PgServer, PgDatabase),
+				    Data = Source{[Schema = "gold", Item = "dim_bank"]}[Data]
+				in
+				    Data
+

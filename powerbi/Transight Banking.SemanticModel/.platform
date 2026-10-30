@@ -1,0 +1,11 @@
+{
+  "$schema": "https://developer.microsoft.com/json-schemas/fabric/gitIntegration/platformProperties/2.0.0/schema.json",
+  "metadata": {
+    "type": "SemanticModel",
+    "displayName": "Transight Banking"
+  },
+  "config": {
+    "version": "2.0",
+    "logicalId": "ccf1c332-b912-4f4e-9488-2a90abf94ce9"
+  }
+}

@@ -1,0 +1,182 @@
+{
+  "$schema": "https://developer.microsoft.com/json-schemas/fabric/item/report/definition/visualContainer/2.13.0/schema.json",
+  "name": "2d6c5f18a2185c3e8ca1",
+  "position": {
+    "x": 16,
+    "y": 490,
+    "z": 18000,
+    "height": 238,
+    "width": 616,
+    "tabOrder": 18000
+  },
+  "visual": {
+    "visualType": "tableEx",
+    "query": {
+      "queryState": {
+        "Values": {
+          "projections": [
+            {
+              "field": {
+                "Column": {
+                  "Expression": {
+                    "SourceRef": {
+                      "Entity": "dim_bank"
+                    }
+                  },
+                  "Property": "bank_name"
+                }
+              },
+              "queryRef": "dim_bank.bank_name",
+              "nativeQueryRef": "bank_name",
+              "displayName": "Bank"
+            },
+            {
+              "field": {
+                "Column": {
+                  "Expression": {
+                    "SourceRef": {
+                      "Entity": "dim_bank"
+                    }
+                  },
+                  "Property": "bank_type"
+                }
+              },
+              "queryRef": "dim_bank.bank_type",
+              "nativeQueryRef": "bank_type",
+              "displayName": "Type"
+            },
+            {
+              "field": {
+                "Measure": {
+                  "Expression": {
+                    "SourceRef": {
+                      "Entity": "fact_transaction"
+                    }
+                  },
+                  "Property": "Transactions"
+                }
+              },
+              "queryRef": "fact_transaction.Transactions",
+              "nativeQueryRef": "Transactions"
+            },
+            {
+              "field": {
+                "Measure": {
+                  "Expression": {
+                    "SourceRef": {
+                      "Entity": "fact_transaction"
+                    }
+                  },
+                  "Property": "Transaction Value (EGP)"
+                }
+              },
+              "queryRef": "fact_transaction.Transaction Value (EGP)",
+              "nativeQueryRef": "Transaction Value (EGP)",
+              "displayName": "Completed value (EGP)"
+            },
+            {
+              "field": {
+                "Measure": {
+                  "Expression": {
+                    "SourceRef": {
+                      "Entity": "fact_transaction"
+                    }
+                  },
+                  "Property": "Fee Revenue (EGP)"
+                }
+              },
+              "queryRef": "fact_transaction.Fee Revenue (EGP)",
+              "nativeQueryRef": "Fee Revenue (EGP)",
+              "displayName": "Fee revenue (EGP)"
+            },
+            {
+              "field": {
+                "Measure": {
+                  "Expression": {
+                    "SourceRef": {
+                      "Entity": "fact_transaction"
+                    }
+                  },
+                  "Property": "Channel Cost (EGP)"
+                }
+              },
+              "queryRef": "fact_transaction.Channel Cost (EGP)",
+              "nativeQueryRef": "Channel Cost (EGP)",
+              "displayName": "Channel cost (EGP)"
+            },
+            {
+              "field": {
+                "Measure": {
+                  "Expression": {
+                    "SourceRef": {
+                      "Entity": "fact_transaction"
+                    }
+                  },
+                  "Property": "Failure Rate %"
+                }
+              },
+              "queryRef": "fact_transaction.Failure Rate %",
+              "nativeQueryRef": "Failure Rate %",
+              "displayName": "Failure rate"
+            },
+            {
+              "field": {
+                "Measure": {
+                  "Expression": {
+                    "SourceRef": {
+                      "Entity": "fact_transaction"
+                    }
+                  },
+                  "Property": "Digital Share %"
+                }
+              },
+              "queryRef": "fact_transaction.Digital Share %",
+              "nativeQueryRef": "Digital Share %",
+              "displayName": "Digital share"
+            }
+          ]
+        }
+      },
+      "sortDefinition": {
+        "sort": [
+          {
+            "field": {
+              "Measure": {
+                "Expression": {
+                  "SourceRef": {
+                    "Entity": "fact_transaction"
+                  }
+                },
+                "Property": "Transaction Value (EGP)"
+              }
+            },
+            "direction": "Descending"
+          }
+        ]
+      }
+    },
+    "visualContainerObjects": {
+      "title": [
+        {
+          "properties": {
+            "show": {
+              "expr": {
+                "Literal": {
+                  "Value": "true"
+                }
+              }
+            },
+            "text": {
+              "expr": {
+                "Literal": {
+                  "Value": "'Bank performance'"
+                }
+              }
+            }
+          }
+        }
+      ]
+    },
+    "drillFilterOtherVisuals": true
+  }
+}

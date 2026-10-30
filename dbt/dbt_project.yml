@@ -1,0 +1,47 @@
+# Semantic layer (dbt + MetricFlow): the DQ tables, and business and
+# data-quality metrics over the gold star schema and those tables. Every
+# model goes to the semantic schema.
+#
+#   models/staging/   the gold and dq tables as sources
+#   models/dq/        DQ tables (loaded): dq_run, dq_rule_result,
+#                     dq_quarantine, dq_correction; "python dq.py metrics"
+#                     builds them and runs their tests (tests/ too)
+#   models/marts/     views MetricFlow reads: transactions (with fee in
+#                     EGP and status flags), the dimensions, the validated
+#                     runs (dq_runs) and their rule results (dq_rule_checks)
+#   models/semantic/  semantic models, the metrics, the time spine
+#
+# "python dq.py semantic" builds the rest, computes every metric with
+# MetricFlow and stores the definitions and values in PostgreSQL
+# (semantic.metric_definition, metric_value; see
+# services/etl-service/src/semantic.py). Directly (inside dbt/):
+#
+#   dbt build --profiles-dir .
+#   mf query --metrics transaction_value_egp,digital_share --group-by metric_time__month
+
+name: transight
+version: "1.0.0"
+config-version: 2
+profile: transight
+
+model-paths: ["models"]
+macro-paths: ["macros"]
+test-paths: ["tests"]
+target-path: target
+clean-targets: ["target", "logs"]
+
+models:
+  transight:
+    +schema: semantic
+    dq:
+      +tags: [dq]
+      +materialized: table
+      +persist_docs: {relation: true, columns: true}
+    marts:
+      +materialized: view
+    semantic:
+      +materialized: table
+
+data_tests:
+  transight:
+    +severity: error

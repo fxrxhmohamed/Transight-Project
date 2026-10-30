@@ -1,0 +1,827 @@
+/// gold.fact_transaction: one row per transaction (latest run per key).
+table fact_transaction
+	lineageTag: dc531e37-eacd-5ad5-a1d7-4962fd575b96
+
+	measure Transactions = COUNTROWS ( 'fact_transaction' )
+		formatString: #,0
+		displayFolder: 1 Volume & Value
+		lineageTag: 1b2388d4-65ee-502f-9fe1-2e9532707f22
+
+	measure 'Completed Transactions' = CALCULATE ( [Transactions], 'fact_transaction'[transaction_status] = "Completed" )
+		formatString: #,0
+		displayFolder: 1 Volume & Value
+		lineageTag: 68c0a5d6-d2d2-56c0-8474-22e03ce3b8ab
+
+	measure 'Attempted Value (EGP)' = SUM ( 'fact_transaction'[amount_egp] )
+		formatString: \E\G\P #,0
+		displayFolder: 1 Volume & Value
+		lineageTag: ab5bbd37-4415-5641-831e-f084f9c4358c
+
+	measure 'Transaction Value (EGP)' = CALCULATE ( [Attempted Value (EGP)], 'fact_transaction'[transaction_status] = "Completed" )
+		formatString: \E\G\P #,0
+		displayFolder: 1 Volume & Value
+		lineageTag: ca6f08f0-cbde-5009-8287-c0e92e3c2ad4
+
+	measure 'Avg Transaction Value (EGP)' = DIVIDE ( [Transaction Value (EGP)], [Completed Transactions] )
+		formatString: \E\G\P #,0.00
+		displayFolder: 1 Volume & Value
+		lineageTag: 269c4510-c620-5e95-85b0-538f71105e5d
+
+	measure 'Median Transaction Value (EGP)' =
+			CALCULATE (
+			    MEDIAN ( 'fact_transaction'[amount_egp] ),
+			    'fact_transaction'[transaction_status] = "Completed"
+			)
+		formatString: \E\G\P #,0
+		displayFolder: 1 Volume & Value
+		lineageTag: 8c8a0fa2-7096-5716-bac5-c75a56f68520
+
+	/// Money into customers' accounts vs out of them. The data has no transfer direction: transfers count as outgoing.
+	measure 'Inflow Value (EGP)' =
+			CALCULATE (
+			    [Transaction Value (EGP)],
+			    'fact_transaction'[transaction_type] IN { "Deposit", "Interest Credit" }
+			)
+		formatString: \E\G\P #,0
+		displayFolder: 1 Volume & Value
+		lineageTag: 6d0cbb5d-bfb8-5806-a45e-a9e85e2039e3
+
+	measure 'Outflow Value (EGP)' =
+			CALCULATE (
+			    [Transaction Value (EGP)],
+			    'fact_transaction'[transaction_type]
+			        IN { "Withdrawal", "Purchase", "Transfer", "Bill Payment", "Fee", "Loan Repayment" }
+			)
+		formatString: \E\G\P #,0
+		displayFolder: 1 Volume & Value
+		lineageTag: 26682b8a-ade0-51ca-ab92-9a0d91c83986
+
+	measure 'Net Flow (EGP)' = [Inflow Value (EGP)] - [Outflow Value (EGP)]
+		formatString: \E\G\P #,0
+		displayFolder: 1 Volume & Value
+		lineageTag: c92a83d0-de2a-5a61-9b39-44c026d7930b
+
+	measure 'Foreign Currency Value Share %' =
+			DIVIDE (
+			    CALCULATE ( [Transaction Value (EGP)], 'fact_transaction'[currency] <> "EGP" ),
+			    [Transaction Value (EGP)]
+			)
+		formatString: 0.0%
+		displayFolder: 1 Volume & Value
+		lineageTag: b7698f71-38cb-5e07-b9ac-2785446048e1
+
+	/// Fees are in the transaction currency: converted with the row's rate (amount_egp / transaction_amount).
+	measure 'Fee Revenue (EGP)' =
+			CALCULATE (
+			    SUMX (
+			        'fact_transaction',
+			        'fact_transaction'[transaction_fee]
+			            * DIVIDE ( 'fact_transaction'[amount_egp], 'fact_transaction'[transaction_amount] )
+			    ),
+			    'fact_transaction'[transaction_status] = "Completed"
+			)
+		formatString: \E\G\P #,0
+		displayFolder: 2 Revenue
+		lineageTag: a90a3484-b9fd-5adb-b5d0-b2838bde1b6b
+
+	measure 'Fee-Bearing Transactions' = CALCULATE ( [Completed Transactions], 'fact_transaction'[transaction_fee] > 0 )
+		formatString: #,0
+		displayFolder: 2 Revenue
+		lineageTag: 36384dfb-76c5-5283-9ba3-b91527debf2b
+
+	measure 'Avg Fee per Fee-Bearing Transaction (EGP)' = DIVIDE ( [Fee Revenue (EGP)], [Fee-Bearing Transactions] )
+		formatString: \E\G\P #,0.00
+		displayFolder: 2 Revenue
+		lineageTag: c30cfe66-9518-5b84-921b-e8f6bb55e626
+
+	measure 'Fee Yield %' =
+			DIVIDE (
+			    [Fee Revenue (EGP)],
+			    CALCULATE ( [Transaction Value (EGP)], 'fact_transaction'[transaction_fee] > 0 )
+			)
+		formatString: 0.0%
+		displayFolder: 2 Revenue
+		lineageTag: e3102ab7-6845-59e7-aa26-8745baaffb32
+
+	measure 'Fee Coverage of Channel Cost %' = DIVIDE ( [Fee Revenue (EGP)], [Channel Cost (EGP)] )
+		formatString: 0.0%
+		displayFolder: 2 Revenue
+		lineageTag: f3c2ce8a-7e53-5dbe-b7c1-a21c35f6bc57
+
+	measure 'Channel Cost (EGP)' = SUM ( 'fact_transaction'[estimated_channel_cost_egp] )
+		formatString: \E\G\P #,0
+		displayFolder: 3 Channel Cost
+		lineageTag: e9fcfae9-b993-50a6-95e5-44c95c16731e
+
+	measure 'Cost per Transaction (EGP)' = DIVIDE ( [Channel Cost (EGP)], [Transactions] )
+		formatString: \E\G\P #,0.00
+		displayFolder: 3 Channel Cost
+		lineageTag: 99b511b6-acb5-54cd-aa10-4c0b7fd01559
+
+	measure 'Cost per 1K EGP Processed' = DIVIDE ( [Channel Cost (EGP)], [Transaction Value (EGP)] ) * 1000
+		formatString: \E\G\P #,0.00
+		displayFolder: 3 Channel Cost
+		lineageTag: d9adcd6c-0114-541d-8125-3d2b64e7def3
+
+	/// Benchmarks, independent of the channel filters on the visual (other filters such as date, type or segment still apply).
+	measure 'Digital Cost per Transaction (EGP)' =
+			CALCULATE (
+			    [Cost per Transaction (EGP)],
+			    REMOVEFILTERS (
+			        'fact_transaction'[channel], 'fact_transaction'[channel_feature],
+			        'fact_transaction'[digital_feature_use], 'fact_transaction'[card_type],
+			        'fact_transaction'[digital_migration_opportunity]
+			    ),
+			    'fact_transaction'[digital_channel_flag] = TRUE ()
+			)
+		formatString: \E\G\P #,0.00
+		displayFolder: 3 Channel Cost
+		lineageTag: 2aa3b710-5569-52a3-8a52-c71e00521394
+
+	measure 'Assisted Cost per Transaction (EGP)' =
+			CALCULATE (
+			    [Cost per Transaction (EGP)],
+			    REMOVEFILTERS (
+			        'fact_transaction'[channel], 'fact_transaction'[channel_feature],
+			        'fact_transaction'[digital_feature_use], 'fact_transaction'[card_type],
+			        'fact_transaction'[digital_migration_opportunity]
+			    ),
+			    'fact_transaction'[digital_channel_flag] = FALSE ()
+			)
+		formatString: \E\G\P #,0.00
+		displayFolder: 3 Channel Cost
+		lineageTag: 4b94f0f3-7d4f-5ca1-ac50-8479b96e768b
+
+	measure 'Assisted vs Digital Cost Multiple' = DIVIDE ( [Assisted Cost per Transaction (EGP)], [Digital Cost per Transaction (EGP)] )
+		formatString: 0.0\x
+		displayFolder: 3 Channel Cost
+		lineageTag: 7eacf200-c928-521d-899c-c16e9f94d824
+
+	measure 'Cost of Failed Transactions (EGP)' = CALCULATE ( [Channel Cost (EGP)], 'fact_transaction'[transaction_status] = "Failed" )
+		formatString: \E\G\P #,0
+		displayFolder: 3 Channel Cost
+		lineageTag: 75cfbd3c-2d85-5a19-9348-cff9239893bb
+
+	measure 'Digital Transactions' = CALCULATE ( [Transactions], 'fact_transaction'[digital_channel_flag] = TRUE () )
+		formatString: #,0
+		displayFolder: 4 Digital Adoption
+		lineageTag: b8526af6-2742-50f3-94ff-b11895acac0f
+
+	measure 'Assisted Transactions' = CALCULATE ( [Transactions], 'fact_transaction'[digital_channel_flag] = FALSE () )
+		formatString: #,0
+		displayFolder: 4 Digital Adoption
+		lineageTag: b0030e70-5f50-5011-90a8-f509a5c03059
+
+	measure 'Digital Share %' = DIVIDE ( [Digital Transactions], [Transactions] )
+		formatString: 0.0%
+		displayFolder: 4 Digital Adoption
+		lineageTag: 20782594-f94b-5bdc-88f0-723bc1124fe5
+
+	measure 'Digital Value (EGP)' = CALCULATE ( [Transaction Value (EGP)], 'fact_transaction'[digital_channel_flag] = TRUE () )
+		formatString: \E\G\P #,0
+		displayFolder: 4 Digital Adoption
+		lineageTag: 6fa8ed0c-9b28-5966-b8df-76164dfc7025
+
+	measure 'Digital Value Share %' = DIVIDE ( [Digital Value (EGP)], [Transaction Value (EGP)] )
+		formatString: 0.0%
+		displayFolder: 4 Digital Adoption
+		lineageTag: 4da73688-3029-555d-bb86-684dd18ea953
+
+	measure 'Digitally Active Customers' = CALCULATE ( [Active Customers], 'fact_transaction'[digital_channel_flag] = TRUE () )
+		formatString: #,0
+		displayFolder: 4 Digital Adoption
+		lineageTag: fb9d3a25-c6cb-5d82-adec-bb31a753e475
+
+	measure 'Digital Adoption Rate %' = DIVIDE ( [Digitally Active Customers], [Active Customers] )
+		formatString: 0.0%
+		displayFolder: 4 Digital Adoption
+		lineageTag: 360d9a1d-d0d0-5820-94fb-589a23212146
+
+	/// Customers who never used a digital channel in the selection: the first audience for digital onboarding campaigns.
+	measure 'Assisted-Only Customers' =
+			VAR AllCustomers = VALUES ( 'fact_transaction'[customer_id] )
+			VAR DigitalCustomers =
+			    CALCULATETABLE (
+			        VALUES ( 'fact_transaction'[customer_id] ),
+			        'fact_transaction'[digital_channel_flag] = TRUE ()
+			    )
+			RETURN
+			    COUNTROWS ( EXCEPT ( AllCustomers, DigitalCustomers ) )
+		formatString: #,0
+		displayFolder: 4 Digital Adoption
+		lineageTag: 74b1bda5-5d4c-5ea0-aef5-99dfc6bfe4d0
+
+	measure 'Digital Login Success Rate %' =
+			DIVIDE (
+			    CALCULATE ( [Digital Transactions], 'fact_transaction'[login_success] = TRUE () ),
+			    CALCULATE ( [Digital Transactions], NOT ISBLANK ( 'fact_transaction'[login_success] ) )
+			)
+		formatString: 0.0%
+		displayFolder: 4 Digital Adoption
+		lineageTag: baa884b2-c01f-5623-963e-33cc679dd2fa
+
+	measure 'Avg Digital Session (min)' =
+			DIVIDE (
+			    CALCULATE (
+			        AVERAGE ( 'fact_transaction'[session_duration_seconds] ),
+			        'fact_transaction'[digital_channel_flag] = TRUE ()
+			    ),
+			    60
+			)
+		formatString: 0.0
+		displayFolder: 4 Digital Adoption
+		lineageTag: 8adabfd6-d3b8-5f35-829d-81e49ca42443
+
+	measure 'Migration Opportunities' = CALCULATE ( [Transactions], 'fact_transaction'[digital_migration_opportunity] = TRUE () )
+		formatString: #,0
+		displayFolder: 5 Migration Opportunity
+		lineageTag: 2d76f300-3e2d-5a39-80a7-aa8878540f92
+
+	measure 'Migration Opportunity Rate %' = DIVIDE ( [Migration Opportunities], [Assisted Transactions] )
+		formatString: 0.0%
+		displayFolder: 5 Migration Opportunity
+		lineageTag: ee7252d0-a41c-538f-9799-b53f00d37004
+
+	measure 'Migration Opportunity Value (EGP)' =
+			CALCULATE (
+			    [Transaction Value (EGP)],
+			    'fact_transaction'[digital_migration_opportunity] = TRUE ()
+			)
+		formatString: \E\G\P #,0
+		displayFolder: 5 Migration Opportunity
+		lineageTag: 9a7961c9-6c5d-5ace-bd18-9715f7081816
+
+	measure 'Customers with Migration Opportunity' = CALCULATE ( [Active Customers], 'fact_transaction'[digital_migration_opportunity] = TRUE () )
+		formatString: #,0
+		displayFolder: 5 Migration Opportunity
+		lineageTag: 241a5f7c-7a63-5297-9996-895b25668bc4
+
+	measure 'Migration Opportunity Cost (EGP)' =
+			CALCULATE (
+			    [Channel Cost (EGP)],
+			    'fact_transaction'[digital_migration_opportunity] = TRUE ()
+			)
+		formatString: \E\G\P #,0
+		displayFolder: 5 Migration Opportunity
+		lineageTag: c507fabe-45c0-53fb-9eeb-27dc81c505e9
+
+	/// What the opportunities cost today minus what they would cost on digital channels (at the digital cost per transaction).
+	measure 'Potential Cost Savings (EGP)' =
+			MAX (
+			    0,
+			    [Migration Opportunity Cost (EGP)]
+			        - [Migration Opportunities] * [Digital Cost per Transaction (EGP)]
+			)
+		formatString: \E\G\P #,0
+		displayFolder: 5 Migration Opportunity
+		lineageTag: 84ec1547-2f92-5c4d-a118-4023cd7ebaf0
+
+	measure 'Potential Savings % of Channel Cost' = DIVIDE ( [Potential Cost Savings (EGP)], [Channel Cost (EGP)] )
+		formatString: 0.0%
+		displayFolder: 5 Migration Opportunity
+		lineageTag: aff4361b-e0e6-5969-a9bf-4e25f8093579
+
+	measure 'Savings per Migrated Customer (EGP)' = DIVIDE ( [Potential Cost Savings (EGP)], [Customers with Migration Opportunity] )
+		formatString: \E\G\P #,0.00
+		displayFolder: 5 Migration Opportunity
+		lineageTag: 5d932ba7-eb55-5555-bc3b-2a2cc4544144
+
+	/// Digital share once every opportunity has moved: the target state.
+	measure 'Digital Share if Migrated %' = DIVIDE ( [Digital Transactions] + [Migration Opportunities], [Transactions] )
+		formatString: 0.0%
+		displayFolder: 5 Migration Opportunity
+		lineageTag: e3a7921f-3b1d-5963-9e78-5c0e54d751e9
+
+	measure 'Failed Transactions' = CALCULATE ( [Transactions], 'fact_transaction'[transaction_status] = "Failed" )
+		formatString: #,0
+		displayFolder: 6 Reliability
+		lineageTag: da6219c6-d5ee-57f1-b850-2522a9b8db36
+
+	measure 'Reversed Transactions' = CALCULATE ( [Transactions], 'fact_transaction'[transaction_status] = "Reversed" )
+		formatString: #,0
+		displayFolder: 6 Reliability
+		lineageTag: 524a82cb-0105-5ceb-810f-916073c99c88
+
+	measure 'Pending Transactions' = CALCULATE ( [Transactions], 'fact_transaction'[transaction_status] = "Pending" )
+		formatString: #,0
+		displayFolder: 6 Reliability
+		lineageTag: 3bcebdd5-5325-5f1c-ae88-2404dca25e1b
+
+	measure 'Success Rate %' = DIVIDE ( [Completed Transactions], [Transactions] )
+		formatString: 0.0%
+		displayFolder: 6 Reliability
+		lineageTag: 989546bf-d8d1-5297-b65b-318d003a44e2
+
+	measure 'Failure Rate %' = DIVIDE ( [Failed Transactions], [Transactions] )
+		formatString: 0.0%
+		displayFolder: 6 Reliability
+		lineageTag: 768c8390-6f02-538c-ac3e-1062fa62bde0
+
+	measure 'Reversal Rate %' = DIVIDE ( [Reversed Transactions], [Transactions] )
+		formatString: 0.0%
+		displayFolder: 6 Reliability
+		lineageTag: 495d2a11-e9e0-5a9a-bbb6-1f4e326d6b90
+
+	measure 'Pending Rate %' = DIVIDE ( [Pending Transactions], [Transactions] )
+		formatString: 0.0%
+		displayFolder: 6 Reliability
+		lineageTag: 9fa4bfe2-ed21-5767-b19b-7e0de96dec82
+
+	measure 'Failed Value (EGP)' = CALCULATE ( [Attempted Value (EGP)], 'fact_transaction'[transaction_status] = "Failed" )
+		formatString: \E\G\P #,0
+		displayFolder: 6 Reliability
+		lineageTag: f25b228f-31fa-53a4-93c4-a34a25446afd
+
+	/// Each reason's part of the failures (put failure_reason on the axis).
+	measure 'Failure Reason Share %' =
+			DIVIDE (
+			    [Failed Transactions],
+			    CALCULATE ( [Failed Transactions], REMOVEFILTERS ( 'fact_transaction'[failure_reason] ) )
+			)
+		formatString: 0.0%
+		displayFolder: 6 Reliability
+		lineageTag: 2cec1660-6073-5b6e-b40d-ecd01b13cfa1
+
+	/// Failures the bank can fix (its systems) vs the customer's side.
+	measure 'Technical Failure Rate %' =
+			DIVIDE (
+			    CALCULATE ( [Failed Transactions], 'fact_transaction'[failure_reason] = "Network Timeout" ),
+			    [Transactions]
+			)
+		formatString: 0.0%
+		displayFolder: 6 Reliability
+		lineageTag: 30781644-7606-53c9-b554-0a7f4236f02a
+
+	measure 'Authentication Failure Rate %' =
+			DIVIDE (
+			    CALCULATE ( [Failed Transactions], 'fact_transaction'[failure_reason] = "Authentication Failed" ),
+			    [Transactions]
+			)
+		formatString: 0.0%
+		displayFolder: 6 Reliability
+		lineageTag: ee1784d3-14a6-5778-b49d-1c5e789f65ed
+
+	measure 'Insufficient Funds Rate %' =
+			DIVIDE (
+			    CALCULATE ( [Failed Transactions], 'fact_transaction'[failure_reason] = "Insufficient Funds" ),
+			    [Transactions]
+			)
+		formatString: 0.0%
+		displayFolder: 6 Reliability
+		lineageTag: 0acd37d0-ce1b-52c4-bde8-bece828074aa
+
+	measure 'Avg Attempts per Transaction' = AVERAGE ( 'fact_transaction'[attempt_count] )
+		formatString: 0.00
+		displayFolder: 6 Reliability
+		lineageTag: 79a8ee5e-0224-5339-affc-5ad30f9bb89e
+
+	measure 'Retried Transactions %' = DIVIDE ( CALCULATE ( [Transactions], 'fact_transaction'[attempt_count] > 1 ), [Transactions] )
+		formatString: 0.0%
+		displayFolder: 6 Reliability
+		lineageTag: 4a5c4c16-d3e2-5217-a896-e315bd7f3428
+
+	measure 'First-Attempt Success Rate %' =
+			DIVIDE (
+			    CALCULATE (
+			        [Transactions],
+			        'fact_transaction'[attempt_count] = 1,
+			        'fact_transaction'[transaction_status] = "Completed"
+			    ),
+			    [Transactions]
+			)
+		formatString: 0.0%
+		displayFolder: 6 Reliability
+		lineageTag: 968a1dda-5137-574f-b5cb-ec3a4f0d59d0
+
+	measure 'Active Customers' = DISTINCTCOUNTNOBLANK ( 'fact_transaction'[customer_id] )
+		formatString: #,0
+		displayFolder: 7 Customers
+		lineageTag: 5794ab4b-86d8-59a4-a9e5-7b5771886cab
+
+	measure 'Active Accounts' = DISTINCTCOUNTNOBLANK ( 'fact_transaction'[account_id] )
+		formatString: #,0
+		displayFolder: 7 Customers
+		lineageTag: 4d6bc920-b5d5-5b17-a5a3-27dfbf0a2b01
+
+	measure 'Transactions per Customer' = DIVIDE ( [Transactions], [Active Customers] )
+		formatString: 0.0
+		displayFolder: 7 Customers
+		lineageTag: 291e21e7-d9f8-5f9f-88b7-eb103ec43d5f
+
+	measure 'Value per Customer (EGP)' = DIVIDE ( [Transaction Value (EGP)], [Active Customers] )
+		formatString: \E\G\P #,0.00
+		displayFolder: 7 Customers
+		lineageTag: 0f937ba0-4300-59ec-b0ca-9b7e2ab7272b
+
+	measure 'Fee Revenue per Customer (EGP)' = DIVIDE ( [Fee Revenue (EGP)], [Active Customers] )
+		formatString: \E\G\P #,0.00
+		displayFolder: 7 Customers
+		lineageTag: aa0aa47a-bea6-5ed2-99d0-e62024faad26
+
+	measure 'Channel Cost per Customer (EGP)' = DIVIDE ( [Channel Cost (EGP)], [Active Customers] )
+		formatString: \E\G\P #,0.00
+		displayFolder: 7 Customers
+		lineageTag: febdf224-5357-55d0-afdd-de1c9b2d49b6
+
+	measure 'Purchase Value (EGP)' = CALCULATE ( [Transaction Value (EGP)], 'fact_transaction'[transaction_type] = "Purchase" )
+		formatString: \E\G\P #,0
+		displayFolder: 8 Payments & Network
+		lineageTag: 360c8ed0-8fe2-599f-a28d-864e4d04659a
+
+	measure 'Avg Purchase Ticket (EGP)' =
+			DIVIDE (
+			    [Purchase Value (EGP)],
+			    CALCULATE ( [Completed Transactions], 'fact_transaction'[transaction_type] = "Purchase" )
+			)
+		formatString: \E\G\P #,0.00
+		displayFolder: 8 Payments & Network
+		lineageTag: dcf17a9b-c2df-553a-89c6-88f6faacd638
+
+	measure 'Bill Payment Value (EGP)' = CALCULATE ( [Transaction Value (EGP)], 'fact_transaction'[transaction_type] = "Bill Payment" )
+		formatString: \E\G\P #,0
+		displayFolder: 8 Payments & Network
+		lineageTag: 7c6e8b34-07ea-5727-a47c-ceb533ad9643
+
+	measure 'Active Merchants' = DISTINCTCOUNTNOBLANK ( 'fact_transaction'[merchant_name] )
+		formatString: #,0
+		displayFolder: 8 Payments & Network
+		lineageTag: 454d7ee9-f299-5810-80c3-095b3d1ac30a
+
+	measure 'Card Transactions' = CALCULATE ( [Transactions], NOT ISBLANK ( 'fact_transaction'[card_type] ) )
+		formatString: #,0
+		displayFolder: 8 Payments & Network
+		lineageTag: 5cea82b6-0123-5271-a895-1d7167587b3d
+
+	measure 'Card Share %' = DIVIDE ( [Card Transactions], [Transactions] )
+		formatString: 0.0%
+		displayFolder: 8 Payments & Network
+		lineageTag: 0fafda1a-9562-577e-ba7d-6c729ede695b
+
+	measure 'Active Branches' = DISTINCTCOUNTNOBLANK ( 'fact_transaction'[branch_id] )
+		formatString: #,0
+		displayFolder: 8 Payments & Network
+		lineageTag: eb10185f-a942-566e-8cd0-ab48e0dd2957
+
+	measure 'Transactions per Branch' = DIVIDE ( [Transactions], [Active Branches] )
+		formatString: #,0
+		displayFolder: 8 Payments & Network
+		lineageTag: 2657c2b6-32fe-58ac-a2d8-c09068029617
+
+	measure 'Transaction Value YTD (EGP)' = TOTALYTD ( [Transaction Value (EGP)], 'dim_date'[date_key] )
+		formatString: \E\G\P #,0
+		displayFolder: 9 Trends
+		lineageTag: edec320b-f36c-5ac2-b185-28a460f4cd92
+
+	measure 'Transaction Value PY (EGP)' = CALCULATE ( [Transaction Value (EGP)], SAMEPERIODLASTYEAR ( 'dim_date'[date_key] ) )
+		formatString: \E\G\P #,0
+		displayFolder: 9 Trends
+		lineageTag: 5ed164a5-18fc-5f62-9c36-1f5b21c71620
+
+	measure 'Transaction Value YoY %' =
+			DIVIDE (
+			    [Transaction Value (EGP)] - [Transaction Value PY (EGP)],
+			    [Transaction Value PY (EGP)]
+			)
+		formatString: 0.0%
+		displayFolder: 9 Trends
+		lineageTag: d08e5dbe-8327-5077-a033-efe6b8324596
+
+	measure 'Transactions PY' = CALCULATE ( [Transactions], SAMEPERIODLASTYEAR ( 'dim_date'[date_key] ) )
+		formatString: #,0
+		displayFolder: 9 Trends
+		lineageTag: 842fcbb6-cdbe-56b5-bcfb-69a1e8855e7a
+
+	measure 'Transactions YoY %' = DIVIDE ( [Transactions] - [Transactions PY], [Transactions PY] )
+		formatString: 0.0%
+		displayFolder: 9 Trends
+		lineageTag: 5d49affc-216a-5edd-8d94-28d991d13535
+
+	measure 'Transactions MoM %' =
+			VAR PriorMonth =
+			    CALCULATE ( [Transactions], DATEADD ( 'dim_date'[date_key], -1, MONTH ) )
+			RETURN
+			    DIVIDE ( [Transactions] - PriorMonth, PriorMonth )
+		formatString: 0.0%
+		displayFolder: 9 Trends
+		lineageTag: c315f1ab-89d3-5942-a54b-40902aaf5195
+
+	measure 'Transaction Value R12M (EGP)' =
+			CALCULATE (
+			    [Transaction Value (EGP)],
+			    DATESINPERIOD ( 'dim_date'[date_key], MAX ( 'dim_date'[date_key] ), -12, MONTH )
+			)
+		formatString: \E\G\P #,0
+		displayFolder: 9 Trends
+		lineageTag: 69e22249-8fbb-5c99-919f-1b1a6d453f20
+
+	measure 'Digital Share PY %' = CALCULATE ( [Digital Share %], SAMEPERIODLASTYEAR ( 'dim_date'[date_key] ) )
+		formatString: 0.0%
+		displayFolder: 9 Trends
+		lineageTag: 6417f18c-99d7-5011-b0b6-32ac13575425
+
+	/// Percentage points (format 0.0%: +0.052 shows as 5.2%).
+	measure 'Digital Share YoY Change (pp)' =
+			IF (
+			    NOT ISBLANK ( [Digital Share PY %] ),
+			    [Digital Share %] - [Digital Share PY %]
+			)
+		formatString: 0.0%
+		displayFolder: 9 Trends
+		lineageTag: c6a58a72-5878-5f79-bf6c-8bed2154633f
+
+	measure 'Active Customers PY' = CALCULATE ( [Active Customers], SAMEPERIODLASTYEAR ( 'dim_date'[date_key] ) )
+		formatString: #,0
+		displayFolder: 9 Trends
+		lineageTag: 9cba2778-6888-5166-8986-24544f0e7922
+
+	measure 'Active Customers YoY %' = DIVIDE ( [Active Customers] - [Active Customers PY], [Active Customers PY] )
+		formatString: 0.0%
+		displayFolder: 9 Trends
+		lineageTag: ede3d747-1feb-5eca-bfff-f39684a1bb62
+
+	measure 'Channel Cost YoY %' =
+			VAR PriorYear =
+			    CALCULATE ( [Channel Cost (EGP)], SAMEPERIODLASTYEAR ( 'dim_date'[date_key] ) )
+			RETURN
+			    DIVIDE ( [Channel Cost (EGP)] - PriorYear, PriorYear )
+		formatString: 0.0%
+		displayFolder: 9 Trends
+		lineageTag: 6c48eca6-99b9-53b1-be0d-9c4575f02083
+
+	measure 'Latest Transaction Date' = MAX ( 'fact_transaction'[transaction_date] )
+		formatString: yyyy-mm-dd
+		displayFolder: 10 Data Freshness
+		lineageTag: 0bb04670-1e18-589e-938e-15ebc318ac7d
+
+	measure 'Load Runs in Data' = DISTINCTCOUNT ( 'fact_transaction'[run_id] )
+		formatString: #,0
+		displayFolder: 10 Data Freshness
+		lineageTag: 30327dea-e2d5-586a-8ebc-d9811cea3230
+
+	measure 'Latest Load Run' = MAX ( 'fact_transaction'[run_id] )
+		displayFolder: 10 Data Freshness
+		lineageTag: afdf3466-63d6-59f0-9094-e74cfc6ec67a
+
+	/// Calendar year of the latest transaction in the current selection.
+	measure 'Latest Year in Selection' = YEAR ( [Latest Transaction Date] )
+		formatString: 0
+		displayFolder: 11 Report
+		lineageTag: b8f385a3-441c-56a3-afde-f596ea37c39f
+
+	/// Transactions YoY % of the latest year in the selection against the year before.
+	measure 'Transactions YoY % (Latest Year)' =
+			VAR LatestYear = [Latest Year in Selection]
+			RETURN
+			    CALCULATE ( [Transactions YoY %], 'dim_date'[year] = LatestYear )
+		formatString: +0.0%;-0.0%;0.0%
+		displayFolder: 11 Report
+		lineageTag: 52b6842c-0747-52b2-a17f-8a06faca1792
+
+	/// Completed value YoY % of the latest year in the selection against the year before.
+	measure 'Transaction Value YoY % (Latest Year)' =
+			VAR LatestYear = [Latest Year in Selection]
+			RETURN
+			    CALCULATE ( [Transaction Value YoY %], 'dim_date'[year] = LatestYear )
+		formatString: +0.0%;-0.0%;0.0%
+		displayFolder: 11 Report
+		lineageTag: 5853b85d-702c-5a02-99c1-2796724ae9c7
+
+	/// Card title: which years the volume growth compares.
+	measure 'Title Volume YoY' =
+			VAR LatestYear = [Latest Year in Selection]
+			RETURN
+			    IF ( NOT ISBLANK ( LatestYear ),
+			        "Volume YoY " & LatestYear & " vs " & LatestYear - 1,
+			        "Volume YoY" )
+		displayFolder: 11 Report
+		lineageTag: a3005ca7-cda1-5409-8c7d-82ca356d3c9e
+
+	/// Card title: which years the value growth compares.
+	measure 'Title Value YoY' =
+			VAR LatestYear = [Latest Year in Selection]
+			RETURN
+			    IF ( NOT ISBLANK ( LatestYear ),
+			        "Value YoY " & LatestYear & " vs " & LatestYear - 1,
+			        "Value YoY" )
+		displayFolder: 11 Report
+		lineageTag: 5fb38f7c-fa01-571e-aaa6-4b8db6fb976e
+
+	/// Header text: first and last transaction date in the selection.
+	measure 'Data Period' =
+			VAR StartDate = MIN ( 'fact_transaction'[transaction_date] )
+			VAR EndDate = [Latest Transaction Date]
+			RETURN
+			    IF ( NOT ISBLANK ( EndDate ),
+			        "Data: " & FORMAT ( StartDate, "d mmm yyyy" ) & " – " & FORMAT ( EndDate, "d mmm yyyy" ) )
+		displayFolder: 11 Report
+		lineageTag: 5b7e9ac2-223f-5a02-aea1-fd17f13148c2
+
+	/// Drill-through header: the branch shown.
+	measure 'Selected Branch' = SELECTEDVALUE ( 'dim_branch'[branch_name], "All branches" )
+		displayFolder: 11 Report
+		lineageTag: 915ca67d-b01f-5014-b5b5-b48f5dd48729
+
+	/// Drill-through header: city, governorate and region of the branch.
+	measure 'Selected Branch Location' =
+			IF (
+			    HASONEVALUE ( 'dim_branch'[branch_id] ),
+			    SELECTEDVALUE ( 'dim_branch'[branch_city] ) & ", " & SELECTEDVALUE ( 'dim_branch'[branch_governorate] )
+			        & " · " & SELECTEDVALUE ( 'dim_branch'[branch_region] ),
+			    "Open this page by drill-through from a branch"
+			)
+		displayFolder: 11 Report
+		lineageTag: 216cee84-0791-5f68-a9a1-b54f5593cd2a
+
+	column transaction_date
+		dataType: dateTime
+		isHidden
+		formatString: yyyy-mm-dd
+		lineageTag: f5d603da-b3f5-5b82-9d68-8bf28dcfc32f
+		summarizeBy: none
+		sourceColumn: transaction_date
+
+		annotation UnderlyingDateTimeDataType = Date
+
+	column transaction_type
+		dataType: string
+		lineageTag: 0eaba726-a51c-5c12-a404-0911a7bb4b71
+		summarizeBy: none
+		sourceColumn: transaction_type
+
+	column transaction_status
+		dataType: string
+		lineageTag: b0a33b82-9ddd-5d9e-927c-3e5c9206542e
+		summarizeBy: none
+		sourceColumn: transaction_status
+
+	column channel
+		dataType: string
+		lineageTag: c1d8f201-aa76-5c17-899e-61a5487face5
+		summarizeBy: none
+		sourceColumn: channel
+
+	column channel_group
+		dataType: string
+		lineageTag: 620f5d64-3c3f-5260-9af5-445efc652c68
+		summarizeBy: none
+		sourceColumn: channel_group
+
+	column channel_feature
+		dataType: string
+		lineageTag: b9a1d90a-dd5a-5d2b-9815-729f9e38f5fc
+		summarizeBy: none
+		sourceColumn: channel_feature
+
+	column digital_feature_use
+		dataType: string
+		lineageTag: ef80bded-be0d-586a-9f6c-0b2f3f900205
+		summarizeBy: none
+		sourceColumn: digital_feature_use
+
+	column currency
+		dataType: string
+		lineageTag: c28c0de1-918d-51c2-bb85-bb46d14cd9d6
+		summarizeBy: none
+		sourceColumn: currency
+
+	column transaction_amount
+		dataType: double
+		isHidden
+		formatString: #,0.00
+		lineageTag: ed255b38-22d3-5c6d-a16f-5881a2768415
+		summarizeBy: none
+		sourceColumn: transaction_amount
+
+	column amount_egp
+		dataType: double
+		isHidden
+		formatString: \E\G\P #,0.00
+		lineageTag: 426a60a6-b4a3-5bd4-ae39-4984769349f1
+		summarizeBy: none
+		sourceColumn: amount_egp
+
+	column transaction_fee
+		dataType: double
+		isHidden
+		formatString: #,0.00
+		lineageTag: 6c2103d9-897b-533d-bd38-6902a6c512ad
+		summarizeBy: none
+		sourceColumn: transaction_fee
+
+	column estimated_channel_cost_egp
+		dataType: double
+		isHidden
+		formatString: \E\G\P #,0.00
+		lineageTag: 066ad396-5694-5922-957c-85c0b7ceb74b
+		summarizeBy: none
+		sourceColumn: estimated_channel_cost_egp
+
+	column card_type
+		dataType: string
+		lineageTag: 794e66af-7988-5e39-89d4-6999c5dfa6f0
+		summarizeBy: none
+		sourceColumn: card_type
+
+	column merchant_name
+		dataType: string
+		lineageTag: 9ccc5404-f503-532f-a0ec-dc1648c76245
+		summarizeBy: none
+		sourceColumn: merchant_name
+
+	column merchant_category
+		dataType: string
+		lineageTag: d0b23c7e-20f8-58a2-81cb-a846b4ff8d3e
+		summarizeBy: none
+		sourceColumn: merchant_category
+
+	column login_success
+		dataType: boolean
+		lineageTag: 3de41b06-5f51-527b-b4cc-9f596f3a8619
+		summarizeBy: none
+		sourceColumn: login_success
+
+	column session_duration_seconds
+		dataType: double
+		isHidden
+		formatString: #,0
+		lineageTag: 8ae532d4-d2d0-5ada-a6a5-31203f294ab0
+		summarizeBy: none
+		sourceColumn: session_duration_seconds
+
+	column attempt_count
+		dataType: int64
+		formatString: 0
+		lineageTag: e93c9bda-83ae-5e2a-a8c4-857856f1f171
+		summarizeBy: none
+		sourceColumn: attempt_count
+
+	column failure_reason
+		dataType: string
+		lineageTag: a5bf0e43-944d-58a7-8ca1-4c40da1d8f47
+		summarizeBy: none
+		sourceColumn: failure_reason
+
+	column digital_channel_flag
+		dataType: boolean
+		lineageTag: f33fb657-c67f-5f7f-8db8-1e5b5d1d9abe
+		summarizeBy: none
+		sourceColumn: digital_channel_flag
+
+	column digital_migration_opportunity
+		dataType: boolean
+		lineageTag: 512542ff-2936-54fd-9f26-00a4370a67b4
+		summarizeBy: none
+		sourceColumn: digital_migration_opportunity
+
+	column account_id
+		dataType: string
+		isHidden
+		lineageTag: ca31efe7-ffff-56e8-876a-e7de7b6a199f
+		summarizeBy: none
+		sourceColumn: account_id
+
+	column bank_id
+		dataType: string
+		isHidden
+		lineageTag: 59f0e00d-f02f-5505-b6dc-40d1441dc3aa
+		summarizeBy: none
+		sourceColumn: bank_id
+
+	column branch_id
+		dataType: string
+		isHidden
+		lineageTag: 5a858576-f2d4-584c-abc7-04cd44f4332c
+		summarizeBy: none
+		sourceColumn: branch_id
+
+	column customer_id
+		dataType: string
+		isHidden
+		lineageTag: 8e9d5c6d-cadc-5f1e-bead-8c6b81ddefeb
+		summarizeBy: none
+		sourceColumn: customer_id
+
+	column run_id
+		dataType: string
+		lineageTag: 025b497c-83c6-5f70-b45a-7052572fc302
+		summarizeBy: none
+		sourceColumn: run_id
+
+	partition fact_transaction = m
+		mode: import
+		source =
+				let
+				    Source = PostgreSQL.Database(PgServer, PgDatabase),
+				    Fact = Source{[Schema = "gold", Item = "fact_transaction"]}[Data],
+				    Selected = Table.SelectColumns(Fact, {"transaction_date", "transaction_type", "transaction_status", "channel", "channel_feature", "digital_feature_use", "currency", "transaction_amount", "amount_egp", "transaction_fee", "estimated_channel_cost_egp", "card_type", "merchant_name", "merchant_category", "login_success", "session_duration_seconds", "attempt_count", "failure_reason", "digital_channel_flag", "digital_migration_opportunity", "account_id", "bank_id", "branch_id", "customer_id", "run_id"}),
+				    // money stays a decimal number (not fixed decimal): fixed decimal rounds
+				    // every intermediate result, e.g. the digital cost per transaction, to 4
+				    // places, and Potential Cost Savings would then miss measure_checks.sql
+				    // the same split as digital_channel_flag: Digital = Mobile App, Internet
+				    // Banking, InstaPay; every other channel (ATM, Branch, POS, Call Center,
+				    // System, Other) is Assisted
+				    WithGroup = Table.AddColumn(Selected, "channel_group",
+				        each if [digital_channel_flag] then "Digital" else "Assisted", type text)
+				in
+				    WithGroup
+

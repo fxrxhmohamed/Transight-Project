@@ -46,7 +46,13 @@ def session(app: str = "metaflow-dq") -> SparkSession:
 
     global _session
     if _session is not None:
-        return _session
+        if _alive(_session):
+            return _session
+        # The JVM went away (killed for memory, crashed): a long-running
+        # process (the correction UI) would otherwise keep failing with
+        # "Connection refused" on every call. Start a new one.
+        _forget(_session)
+        _session = None
 
     builder = (
         SparkSession.builder.appName(app)
@@ -85,6 +91,32 @@ def session(app: str = "metaflow-dq") -> SparkSession:
     _session = builder.getOrCreate()
     _session.sparkContext.setLogLevel(os.environ.get("SPARK_LOG_LEVEL", "WARN"))
     return _session
+
+
+def _alive(spark: SparkSession) -> bool:
+    """Whether the session's JVM still answers and its context is running."""
+
+    try:
+        return not spark.sparkContext._jsc.sc().isStopped()
+    except Exception:
+        return False
+
+
+def _forget(spark: SparkSession) -> None:
+    """Drop PySpark's references to a dead JVM so getOrCreate launches a new
+    gateway instead of reusing the one that no longer answers."""
+
+    from pyspark import SparkContext
+
+    try:
+        spark.sparkContext.stop()
+    except Exception:
+        pass
+    SparkContext._active_spark_context = None
+    SparkContext._gateway = None
+    SparkContext._jvm = None
+    SparkSession._instantiatedSession = None
+    SparkSession._activeSession = None
 
 
 def local_frame(rows: Iterable[Sequence[Any]], schema: str) -> DataFrame:

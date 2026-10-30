@@ -1,0 +1,185 @@
+{
+  "$schema": "https://developer.microsoft.com/json-schemas/fabric/item/report/definition/visualContainer/2.13.0/schema.json",
+  "name": "0dd75253253554209e7e",
+  "position": {
+    "x": 404,
+    "y": 232,
+    "z": 15000,
+    "height": 250,
+    "width": 480,
+    "tabOrder": 15000
+  },
+  "visual": {
+    "visualType": "lineClusteredColumnComboChart",
+    "query": {
+      "queryState": {
+        "Category": {
+          "projections": [
+            {
+              "field": {
+                "Column": {
+                  "Expression": {
+                    "SourceRef": {
+                      "Entity": "dq_rule_checks"
+                    }
+                  },
+                  "Property": "dq_dimension"
+                }
+              },
+              "queryRef": "dq_rule_checks.dq_dimension",
+              "nativeQueryRef": "dq_dimension",
+              "active": true,
+              "displayName": "DQ dimension"
+            }
+          ]
+        },
+        "Tooltips": {
+          "projections": [
+            {
+              "field": {
+                "Measure": {
+                  "Expression": {
+                    "SourceRef": {
+                      "Entity": "dq_rule_checks"
+                    }
+                  },
+                  "Property": "Rule Failure Rate %"
+                }
+              },
+              "queryRef": "dq_rule_checks.Rule Failure Rate %",
+              "nativeQueryRef": "Rule Failure Rate %",
+              "displayName": "Failure rate"
+            },
+            {
+              "field": {
+                "Measure": {
+                  "Expression": {
+                    "SourceRef": {
+                      "Entity": "dq_rule_checks"
+                    }
+                  },
+                  "Property": "Values Checked"
+                }
+              },
+              "queryRef": "dq_rule_checks.Values Checked",
+              "nativeQueryRef": "Values Checked"
+            }
+          ]
+        },
+        "Y": {
+          "projections": [
+            {
+              "field": {
+                "Measure": {
+                  "Expression": {
+                    "SourceRef": {
+                      "Entity": "dq_rule_checks"
+                    }
+                  },
+                  "Property": "Values Failed"
+                }
+              },
+              "queryRef": "dq_rule_checks.Values Failed",
+              "nativeQueryRef": "Values Failed",
+              "displayName": "Values failed"
+            }
+          ]
+        },
+        "Y2": {
+          "projections": [
+            {
+              "field": {
+                "Measure": {
+                  "Expression": {
+                    "SourceRef": {
+                      "Entity": "dq_rule_checks"
+                    }
+                  },
+                  "Property": "Rule Repair Rate %"
+                }
+              },
+              "queryRef": "dq_rule_checks.Rule Repair Rate %",
+              "nativeQueryRef": "Rule Repair Rate %",
+              "displayName": "Repair rate"
+            }
+          ]
+        }
+      },
+      "sortDefinition": {
+        "sort": [
+          {
+            "field": {
+              "Measure": {
+                "Expression": {
+                  "SourceRef": {
+                    "Entity": "dq_rule_checks"
+                  }
+                },
+                "Property": "Values Failed"
+              }
+            },
+            "direction": "Descending"
+          }
+        ]
+      }
+    },
+    "objects": {
+      "labels": [
+        {
+          "properties": {
+            "show": {
+              "expr": {
+                "Literal": {
+                  "Value": "true"
+                }
+              }
+            }
+          }
+        }
+      ],
+      "legend": [
+        {
+          "properties": {
+            "show": {
+              "expr": {
+                "Literal": {
+                  "Value": "true"
+                }
+              }
+            },
+            "position": {
+              "expr": {
+                "Literal": {
+                  "Value": "'Top'"
+                }
+              }
+            }
+          }
+        }
+      ]
+    },
+    "visualContainerObjects": {
+      "title": [
+        {
+          "properties": {
+            "show": {
+              "expr": {
+                "Literal": {
+                  "Value": "true"
+                }
+              }
+            },
+            "text": {
+              "expr": {
+                "Literal": {
+                  "Value": "'Rule failures and repair rate by DQ dimension'"
+                }
+              }
+            }
+          }
+        }
+      ]
+    },
+    "drillFilterOtherVisuals": true
+  }
+}

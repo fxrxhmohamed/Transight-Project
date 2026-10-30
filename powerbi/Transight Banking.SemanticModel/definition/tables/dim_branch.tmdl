@@ -1,0 +1,44 @@
+/// gold.dim_branch (not related to dim_bank: the fact carries bank_id).
+table dim_branch
+	lineageTag: c9859f6e-fe82-5d1b-ac77-f8db6b2f2f50
+
+	column branch_id
+		dataType: string
+		lineageTag: 4ea40557-19a3-5280-a8e3-a14eaf68c6bc
+		summarizeBy: none
+		sourceColumn: branch_id
+
+	column branch_name
+		dataType: string
+		lineageTag: 69a0b921-763d-5e22-8bff-3c64c20f92b7
+		summarizeBy: none
+		sourceColumn: branch_name
+
+	column branch_city
+		dataType: string
+		lineageTag: ab60e26c-4bf7-5fc6-85b4-b1e0a3cd9469
+		summarizeBy: none
+		sourceColumn: branch_city
+
+	column branch_governorate
+		dataType: string
+		lineageTag: 206c8096-6bc9-5ebf-a147-0c55459c3894
+		summarizeBy: none
+		sourceColumn: branch_governorate
+
+	column branch_region
+		dataType: string
+		lineageTag: ce800b27-3c63-559f-99f8-32ed50ff39da
+		summarizeBy: none
+		sourceColumn: branch_region
+
+	partition dim_branch = m
+		mode: import
+		source =
+				let
+				    Source = PostgreSQL.Database(PgServer, PgDatabase),
+				    Data = Source{[Schema = "gold", Item = "dim_branch"]}[Data],
+				    Selected = Table.SelectColumns(Data, {"branch_id", "branch_name", "branch_city", "branch_governorate", "branch_region"})
+				in
+				    Selected
+

@@ -1,0 +1,28 @@
+version: 2
+
+sources:
+  - name: gold
+    description: >
+      Star schema built by gold.py for the banking_transactions dataset
+      (grain: transaction). Current data only: the latest record per
+      transaction from the latest full load on.
+    schema: gold
+    tables:
+      - name: fact_transaction
+      - name: dim_customer
+      - name: dim_branch
+      - name: dim_bank
+
+  - name: dq
+    description: >
+      What the DQ engine records for every run (sql/02_dq.sql): round
+      summaries, automatic repairs, the quarantine ledger and its history,
+      manual corrections.
+    schema: dq
+    tables:
+      - name: round_result
+      - name: remediation_audit
+      - name: quarantine_status
+      - name: quarantine_history
+      - name: correction
+      - name: correction_log

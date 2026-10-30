@@ -14,8 +14,8 @@
 --   dq.load_log             every load into silver: initial or incremental,
 --                           rows inserted / updated / unchanged
 --
---   metrics.*               the DQ metric views for Power BI
---                           (sql/04_metrics.sql, python dq.py metrics)
+--   semantic.dq_*           the DQ tables built from these by dbt
+--                           (dbt/models/dq, python dq.py metrics)
 --
 -- Record tables, one per dataset, are created by the dq-service
 -- (layout.py), one text column per data column like bronze:
@@ -32,7 +32,6 @@
 
 CREATE SCHEMA IF NOT EXISTS dq;
 CREATE SCHEMA IF NOT EXISTS silver;
-CREATE SCHEMA IF NOT EXISTS metrics;
 
 -- ---- Runs ---------------------------------------------------------------
 

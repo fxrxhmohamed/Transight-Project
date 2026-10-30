@@ -1,0 +1,81 @@
+/// semantic.dq_correction grouped by run, round, type, action, outcome, rule and column.
+table dq_correction_summary
+	lineageTag: 64927b0e-dc92-5f55-a52e-ed44fb50b601
+
+	/// rows of semantic.dq_correction
+	measure Corrections = SUM ( 'dq_correction_summary'[correction_count] )
+		formatString: #,0
+		displayFolder: DQ Corrections
+		lineageTag: d71bd97d-9d1f-5673-8b97-3d5ad742201b
+
+	column run_id
+		dataType: string
+		lineageTag: f4fd3b55-60bf-5ba7-8306-ec5737705862
+		summarizeBy: none
+		sourceColumn: run_id
+
+	column dataset
+		dataType: string
+		lineageTag: e85a5d66-f3a4-5607-826f-c3fdf50467cf
+		summarizeBy: none
+		sourceColumn: dataset
+
+	column round
+		dataType: int64
+		formatString: 0
+		lineageTag: 04de4d85-cb38-5f57-b383-238fccd1d920
+		summarizeBy: none
+		sourceColumn: round
+
+	column correction_type
+		dataType: string
+		lineageTag: ef9941cf-8a61-5f7a-b6ba-20ca209a1be5
+		summarizeBy: none
+		sourceColumn: correction_type
+
+	column action
+		dataType: string
+		lineageTag: 12b561e2-de33-5342-b338-91475009668a
+		summarizeBy: none
+		sourceColumn: action
+
+	column outcome
+		dataType: string
+		lineageTag: 6ff412f7-2436-5948-bd04-6689231f0534
+		summarizeBy: none
+		sourceColumn: outcome
+
+	column rule_id
+		dataType: string
+		lineageTag: c9e979e8-887b-5ad3-9420-a6c651b8f1ae
+		summarizeBy: none
+		sourceColumn: rule_id
+
+	column column_name
+		dataType: string
+		lineageTag: 3a24b575-0ea8-5120-b6f4-420e9a97f5bf
+		summarizeBy: none
+		sourceColumn: column_name
+
+	column correction_count
+		dataType: int64
+		isHidden
+		formatString: #,0
+		lineageTag: dbbe81f6-9827-5859-8bbd-4e0e68388c0e
+		summarizeBy: none
+		sourceColumn: correction_count
+
+	partition dq_correction_summary = m
+		mode: import
+		source =
+				let
+				    Source = PostgreSQL.Database(PgServer, PgDatabase),
+				    Corrections = Source{[Schema = "semantic", Item = "dq_correction"]}[Data],
+				    // one row per kind of correction (the detail holds every changed value)
+				    Grouped = Table.Group(Corrections,
+				        {"run_id", "dataset", "round", "correction_type", "action", "outcome", "rule_id", "column"},
+				        {{"correction_count", each Table.RowCount(_), Int64.Type}}),
+				    Renamed = Table.RenameColumns(Grouped, {{"column", "column_name"}})
+				in
+				    Renamed
+

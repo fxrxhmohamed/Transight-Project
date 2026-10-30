@@ -1,0 +1,183 @@
+{
+  "$schema": "https://developer.microsoft.com/json-schemas/fabric/item/report/definition/visualContainer/2.13.0/schema.json",
+  "name": "cd4c6bc8b2f45dc2aca3",
+  "position": {
+    "x": 16,
+    "y": 490,
+    "z": 17000,
+    "height": 238,
+    "width": 640,
+    "tabOrder": 17000
+  },
+  "visual": {
+    "visualType": "tableEx",
+    "query": {
+      "queryState": {
+        "Values": {
+          "projections": [
+            {
+              "field": {
+                "Column": {
+                  "Expression": {
+                    "SourceRef": {
+                      "Entity": "dq_rule_checks"
+                    }
+                  },
+                  "Property": "rule_id"
+                }
+              },
+              "queryRef": "dq_rule_checks.rule_id",
+              "nativeQueryRef": "rule_id",
+              "displayName": "Rule"
+            },
+            {
+              "field": {
+                "Column": {
+                  "Expression": {
+                    "SourceRef": {
+                      "Entity": "dq_rule_checks"
+                    }
+                  },
+                  "Property": "rule_name"
+                }
+              },
+              "queryRef": "dq_rule_checks.rule_name",
+              "nativeQueryRef": "rule_name",
+              "displayName": "Name"
+            },
+            {
+              "field": {
+                "Column": {
+                  "Expression": {
+                    "SourceRef": {
+                      "Entity": "dq_rule_checks"
+                    }
+                  },
+                  "Property": "dq_dimension"
+                }
+              },
+              "queryRef": "dq_rule_checks.dq_dimension",
+              "nativeQueryRef": "dq_dimension",
+              "displayName": "Dimension"
+            },
+            {
+              "field": {
+                "Column": {
+                  "Expression": {
+                    "SourceRef": {
+                      "Entity": "dq_rule_checks"
+                    }
+                  },
+                  "Property": "severity"
+                }
+              },
+              "queryRef": "dq_rule_checks.severity",
+              "nativeQueryRef": "severity",
+              "displayName": "Severity"
+            },
+            {
+              "field": {
+                "Measure": {
+                  "Expression": {
+                    "SourceRef": {
+                      "Entity": "dq_rule_checks"
+                    }
+                  },
+                  "Property": "Values Failed"
+                }
+              },
+              "queryRef": "dq_rule_checks.Values Failed",
+              "nativeQueryRef": "Values Failed",
+              "displayName": "Failed"
+            },
+            {
+              "field": {
+                "Measure": {
+                  "Expression": {
+                    "SourceRef": {
+                      "Entity": "dq_rule_checks"
+                    }
+                  },
+                  "Property": "Rule Failure Rate %"
+                }
+              },
+              "queryRef": "dq_rule_checks.Rule Failure Rate %",
+              "nativeQueryRef": "Rule Failure Rate %",
+              "displayName": "Failure rate"
+            },
+            {
+              "field": {
+                "Measure": {
+                  "Expression": {
+                    "SourceRef": {
+                      "Entity": "dq_rule_checks"
+                    }
+                  },
+                  "Property": "Values Repaired"
+                }
+              },
+              "queryRef": "dq_rule_checks.Values Repaired",
+              "nativeQueryRef": "Values Repaired",
+              "displayName": "Repaired"
+            },
+            {
+              "field": {
+                "Measure": {
+                  "Expression": {
+                    "SourceRef": {
+                      "Entity": "dq_rule_checks"
+                    }
+                  },
+                  "Property": "Rule Repair Rate %"
+                }
+              },
+              "queryRef": "dq_rule_checks.Rule Repair Rate %",
+              "nativeQueryRef": "Rule Repair Rate %",
+              "displayName": "Repair rate"
+            }
+          ]
+        }
+      },
+      "sortDefinition": {
+        "sort": [
+          {
+            "field": {
+              "Measure": {
+                "Expression": {
+                  "SourceRef": {
+                    "Entity": "dq_rule_checks"
+                  }
+                },
+                "Property": "Values Failed"
+              }
+            },
+            "direction": "Descending"
+          }
+        ]
+      }
+    },
+    "visualContainerObjects": {
+      "title": [
+        {
+          "properties": {
+            "show": {
+              "expr": {
+                "Literal": {
+                  "Value": "true"
+                }
+              }
+            },
+            "text": {
+              "expr": {
+                "Literal": {
+                  "Value": "'Validation results by rule (first validation round)'"
+                }
+              }
+            }
+          }
+        }
+      ]
+    },
+    "drillFilterOtherVisuals": true
+  }
+}

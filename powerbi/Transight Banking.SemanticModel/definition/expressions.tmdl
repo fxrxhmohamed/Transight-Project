@@ -1,0 +1,12 @@
+/// PostgreSQL host:port (POSTGRES_HOST:POSTGRES_PORT in .env)
+expression PgServer = "localhost:5432" meta [IsParameterQuery=true, Type="Text", IsParameterQueryRequired=true]
+	lineageTag: bfb099cf-e079-5601-a520-300eccf29246
+
+	annotation PBI_ResultType = Text
+
+/// PostgreSQL database (POSTGRES_DB in .env)
+expression PgDatabase = "metaflow" meta [IsParameterQuery=true, Type="Text", IsParameterQueryRequired=true]
+	lineageTag: 9d2c469b-5a3b-539b-996f-a27471f2dbbf
+
+	annotation PBI_ResultType = Text
+

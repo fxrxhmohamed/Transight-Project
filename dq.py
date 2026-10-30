@@ -14,17 +14,23 @@ Steps, in pipeline order
     import-corrections  import a filled-in template (--file)
     revalidate          apply the corrections and validate again
     merge               valid + resolved records -> silver.<dataset> (typed)
-    metrics             the DQ metric views for Power BI (metrics schema,
-                        every run): apply sql/04_metrics.sql and check them
+    metrics             load the DQ tables of the semantic layer (dbt:
+                        semantic.dq_run, dq_rule_result, dq_quarantine,
+                        dq_correction, every run) and check them
     metadata            describe silver in the meta schema (metadata engine)
     gold                build the gold star schema from the metadata (AutoETL)
+    semantic            the business and DQ metrics of the semantic layer
+                        (dbt + MetricFlow): definitions and values (monthly,
+                        total, DQ per run) stored in the semantic schema
+    powerbi-refresh     refresh the Power BI semantic model from PostgreSQL
+                        (skipped, exit code 99, when POWERBI_* is not set)
     import-files        load runs kept in data/ by earlier versions into
                         the database (once)
 Helpers
     status              quarantine counts per status and round
     ui                  start the correction UI (Streamlit)
-    pipeline            ingest, profile, validate, merge, metrics, metadata
-                        and gold in one go
+    pipeline            ingest, profile, validate, merge, metrics, metadata,
+                        gold, semantic and powerbi-refresh in one go
 
 Every step takes --run (an ingestion id, default 'latest') and --rules,
 and passes the options to the service script that does the work. The
@@ -40,9 +46,12 @@ environment variables (see .env.example). Run it in the pipeline container
     import-corrections,
     revalidate, status  services/dq-service/src/quarantine.py
     merge               services/dq-service/src/merge.py
-    metrics             services/dq-service/src/metrics.py
+    metrics             services/dq-service/src/metrics.py (runs dbt)
     metadata            services/metadata-service/src/metadata.py
     gold                services/etl-service/src/gold.py
+    semantic            services/etl-service/src/semantic.py (runs dbt and mf
+                        from DBT, default dbt on the PATH)
+    powerbi-refresh     services/etl-service/src/powerbi.py
     import-files        services/dq-service/src/import_files.py
 
 Exit code: the step's own (0 = success).
@@ -72,6 +81,8 @@ INGEST = SERVICES / "ingestion-service" / "src" / "ingest.py"
 PROFILER = SERVICES / "metadata-service" / "src" / "profiler.py"
 METADATA = SERVICES / "metadata-service" / "src" / "metadata.py"
 GOLD = SERVICES / "etl-service" / "src" / "gold.py"
+SEMANTIC = SERVICES / "etl-service" / "src" / "semantic.py"
+POWERBI = SERVICES / "etl-service" / "src" / "powerbi.py"
 DQ = SERVICES / "dq-service" / "src"
 ENGINE = DQ / "dq_engine.py"
 QUARANTINE = DQ / "quarantine.py"
@@ -84,6 +95,8 @@ DEFAULT_RULES = ROOT / "config" / "rules" / "quality_rules.yaml"
 DEFAULT_DATA = ROOT / "data"
 # ingest.py: the file is already in bronze (nothing loaded).
 ALREADY_INGESTED_EXIT = 99
+# powerbi.py: Power BI is not configured (nothing refreshed).
+NOT_CONFIGURED_EXIT = 99
 
 
 def load_env(path: Path) -> None:
@@ -168,6 +181,12 @@ def command_line(step: str, args: argparse.Namespace) -> list[str]:
     if step in ("metadata", "gold"):
         return [str(METADATA if step == "metadata" else GOLD), "--rules", str(args.rules)]
 
+    if step == "semantic":
+        return [str(SEMANTIC)]
+
+    if step == "powerbi-refresh":
+        return [str(POWERBI)]
+
     if step == "import-files":
         return [str(IMPORT_FILES), "--rules", str(args.rules),
                 "--data", str(args.data.resolve()),
@@ -187,7 +206,8 @@ def run_step(step: str, args: argparse.Namespace) -> int:
 
 
 def run_pipeline(args: argparse.Namespace) -> int:
-    """ingest -> profile -> validate -> merge -> metrics -> metadata -> gold."""
+    """ingest -> profile -> validate -> merge -> metrics -> metadata -> gold
+    -> semantic -> powerbi-refresh (when Power BI is configured)."""
 
     # Shown as it comes; the last line is the new ingestion id.
     line = ""
@@ -205,10 +225,13 @@ def run_pipeline(args: argparse.Namespace) -> int:
         return process.returncode
 
     args.run = line.strip()
-    for step in ("profile", "validate", "merge", "metrics", "metadata", "gold"):
+    for step in ("profile", "validate", "merge", "metrics", "metadata", "gold", "semantic"):
         code = run_step(step, args)
         if code:
             return code
+    code = run_step("powerbi-refresh", args)
+    if code not in (0, NOT_CONFIGURED_EXIT):
+        return code
     print(f"Pipeline finished for {args.run}.")
     return 0
 
@@ -234,7 +257,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
     for name, help_text in (
         ("ingest", "Load a source file into bronze."),
-        ("pipeline", "Ingest, profile, validate, merge, metrics, metadata and gold."),
+        ("pipeline", "Ingest, profile, validate, merge, metrics, metadata, gold, "
+         "semantic and powerbi-refresh."),
     ):
         step = add(name, help_text)
         step.add_argument("--input", type=Path, default=None,
@@ -264,9 +288,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
     add("merge", "Merge valid and resolved records into silver.<dataset>.").add_argument(
         "--published-by", default=None, help="Who published (kept with the merge).")
-    add("metrics", "Update and check the DQ metric views (every run).")
+    add("metrics", "Load and check the DQ tables of the semantic layer (every run).")
     add("metadata", "Describe silver in the meta schema.")
     add("gold", "Build the gold star schema from the metadata.")
+    add("semantic", "Compute the semantic layer's business and DQ metrics "
+        "(dbt + MetricFlow) and store them in the semantic schema.")
+    add("powerbi-refresh", "Refresh the Power BI semantic model from PostgreSQL "
+        "(exit code 99 when Power BI is not configured).")
     add("import-files", "Load runs kept in data/ by earlier versions "
         "(default: every run).").add_argument(
         "--data", type=Path, default=DEFAULT_DATA,

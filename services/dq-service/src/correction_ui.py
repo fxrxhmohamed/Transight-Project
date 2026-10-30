@@ -20,7 +20,7 @@ Pages
                    metrics, metadata, gold; the UI runs no Spark for it and
                    the button waits while a load, correction file or
                    publish is running). Without Airflow it runs the merge
-                   (merge.py) and the metric tables (python dq.py metrics)
+                   (merge.py) and the DQ tables (python dq.py metrics)
                    here
     Upload a file  download the list of problems, fill it in (e.g. in
                    Excel), upload it; it is checked before anything is sent.
@@ -868,7 +868,7 @@ def when(timestamp: str) -> str:
 
 
 def refresh_metrics() -> None:
-    """Update and check the metric views (python dq.py metrics)."""
+    """Load and check the DQ tables (python dq.py metrics)."""
 
     done = subprocess.run(
         [sys.executable, str(ROOT / "dq.py"), "metrics"],

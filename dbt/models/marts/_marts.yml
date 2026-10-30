@@ -1,0 +1,44 @@
+version: 2
+
+models:
+  - name: fct_transactions
+    description: Transactions of gold.fact_transaction (view; money in EGP).
+    columns:
+      - name: transaction_id
+        data_tests: [unique, not_null]
+      - name: transaction_status
+        data_tests:
+          - accepted_values:
+              arguments:
+                values: [Completed, Failed, Pending, Reversed]
+      - name: amount_egp
+        data_tests: [not_null]
+  - name: dim_customers
+    description: Customer attributes of gold.dim_customer (view, no personal data).
+    columns:
+      - name: customer_id
+        data_tests: [unique, not_null]
+  - name: dim_branches
+    description: Branches of gold.dim_branch (view).
+    columns:
+      - name: branch_id
+        data_tests: [unique, not_null]
+  - name: dim_banks
+    description: Banks of gold.dim_bank (view).
+    columns:
+      - name: bank_id
+        data_tests: [unique, not_null]
+  - name: dq_runs
+    description: Validated runs with their current DQ figures (view over dq_run).
+    columns:
+      - name: run_id
+        data_tests: [unique, not_null]
+      - name: run_date
+        data_tests: [not_null]
+      - name: processed
+        data_tests: [not_null]
+  - name: dq_rule_checks
+    description: Rule results of each run's first validation (view over dq_rule_result).
+    columns:
+      - name: rule_check_id
+        data_tests: [unique, not_null]

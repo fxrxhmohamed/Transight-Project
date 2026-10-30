@@ -1,0 +1,92 @@
+/// gold.dim_date: one row per day the facts cover. Marked as the date table.
+table dim_date
+	lineageTag: 2c07e026-66bf-57d5-a5a2-12a57bfb9891
+	dataCategory: Time
+
+	column date_key
+		dataType: dateTime
+		isKey
+		formatString: yyyy-mm-dd
+		lineageTag: 9a2e58bc-fd8a-5dd8-b203-1f1295f60dd6
+		summarizeBy: none
+		sourceColumn: date_key
+
+		annotation UnderlyingDateTimeDataType = Date
+
+	column year
+		dataType: int64
+		formatString: 0
+		lineageTag: c6c34cfd-ca67-56e9-9e1c-9901778016e1
+		summarizeBy: none
+		sourceColumn: year
+
+	column quarter
+		dataType: int64
+		formatString: 0
+		lineageTag: f0f22199-2bdd-59bf-b9bf-b71cc1b7f111
+		summarizeBy: none
+		sourceColumn: quarter
+
+	column month
+		dataType: int64
+		formatString: 0
+		lineageTag: 5609dfe6-658b-56a8-9867-532ad28c3243
+		summarizeBy: none
+		sourceColumn: month
+
+	column month_name
+		dataType: string
+		lineageTag: 32b8687a-e876-5843-be60-a1e27df0eb34
+		summarizeBy: none
+		sourceColumn: month_name
+		sortByColumn: month
+
+	column year_month
+		dataType: string
+		lineageTag: 3945346a-5b52-540e-8144-dae432bf408b
+		summarizeBy: none
+		sourceColumn: year_month
+
+	column day
+		dataType: int64
+		formatString: 0
+		lineageTag: da7556e1-3248-5c95-9a37-b61d7c1d8d7e
+		summarizeBy: none
+		sourceColumn: day
+
+	column day_of_week
+		dataType: int64
+		formatString: 0
+		lineageTag: fae58c49-5380-5095-8835-97e03ab3936a
+		summarizeBy: none
+		sourceColumn: day_of_week
+
+	column day_name
+		dataType: string
+		lineageTag: 45e4d8c0-b327-5fef-a8fc-6097645fece0
+		summarizeBy: none
+		sourceColumn: day_name
+		sortByColumn: day_of_week
+
+	column week_of_year
+		dataType: int64
+		formatString: 0
+		lineageTag: 18677d4a-d842-581d-b35b-fcd0a57836fe
+		summarizeBy: none
+		sourceColumn: week_of_year
+
+	column is_weekend
+		dataType: boolean
+		lineageTag: 3b6e49ff-3ba9-50fe-bf8e-246ba871536a
+		summarizeBy: none
+		sourceColumn: is_weekend
+
+	partition dim_date = m
+		mode: import
+		source =
+				let
+				    Source = PostgreSQL.Database(PgServer, PgDatabase),
+				    Data = Source{[Schema = "gold", Item = "dim_date"]}[Data]
+				in
+				    Data
+

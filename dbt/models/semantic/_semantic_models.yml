@@ -1,0 +1,286 @@
+version: 2
+
+models:
+  - name: metricflow_time_spine
+    description: Daily time spine for MetricFlow.
+    time_spine:
+      standard_granularity_column: date_day
+    columns:
+      - name: date_day
+        granularity: day
+
+semantic_models:
+  - name: transactions
+    description: One row per transaction of the current data (gold).
+    model: ref('fct_transactions')
+    defaults:
+      agg_time_dimension: transaction_date
+    entities:
+      - name: transaction
+        type: primary
+        expr: transaction_id
+      - name: customer
+        type: foreign
+        expr: customer_id
+      - name: branch
+        type: foreign
+        expr: branch_id
+      - name: bank
+        type: foreign
+        expr: bank_id
+    dimensions:
+      - name: transaction_date
+        type: time
+        type_params:
+          time_granularity: day
+      - name: transaction_type
+        type: categorical
+      - name: transaction_status
+        type: categorical
+      - name: channel
+        type: categorical
+      - name: channel_feature
+        type: categorical
+      - name: currency
+        type: categorical
+      - name: failure_reason
+        type: categorical
+      - name: digital_channel_flag
+        type: categorical
+      - name: digital_migration_opportunity
+        type: categorical
+      - name: is_completed
+        type: categorical
+      - name: has_fee
+        type: categorical
+      - name: card_type
+        type: categorical
+      - name: is_card
+        type: categorical
+      - name: login_success
+        type: categorical
+      - name: is_retried
+        type: categorical
+      - name: is_first_attempt
+        type: categorical
+    measures:
+      - name: transaction_count
+        description: Transactions.
+        agg: count
+        expr: transaction_id
+      - name: amount_egp
+        description: Transaction amount in EGP.
+        agg: sum
+      - name: fee_egp
+        description: Fee in EGP (converted with the transaction's rate).
+        agg: sum
+      - name: channel_cost_egp
+        description: Estimated cost to the bank of serving the transaction.
+        agg: sum
+        expr: estimated_channel_cost_egp
+      - name: customers_transacting
+        description: Distinct customers.
+        agg: count_distinct
+        expr: customer_id
+      - name: median_amount_egp
+        description: Median transaction amount in EGP.
+        agg: median
+        expr: amount_egp
+      - name: avg_session_minutes
+        description: Average session length, in minutes.
+        agg: average
+        expr: session_duration_seconds / 60.0
+      - name: avg_attempts
+        description: Average attempts per transaction.
+        agg: average
+        expr: attempt_count
+      - name: accounts_transacting
+        description: Distinct accounts.
+        agg: count_distinct
+        expr: account_id
+      - name: merchants_transacting
+        description: Distinct merchants.
+        agg: count_distinct
+        expr: merchant_name
+      - name: branches_transacting
+        description: Distinct branches.
+        agg: count_distinct
+        expr: branch_id
+      - name: load_runs
+        description: Distinct ingestions the transactions come from.
+        agg: count_distinct
+        expr: run_id
+      - name: latest_transaction_day
+        description: Latest transaction date as a number (YYYYMMDD).
+        agg: max
+        expr: to_char(transaction_date, 'YYYYMMDD')::integer
+      - name: latest_load_run_number
+        description: Latest ingestion id as a number (ING_20261013_001 -> 20261013001).
+        agg: max
+        expr: regexp_replace(run_id, '[^0-9]', '', 'g')::bigint
+
+  - name: customers
+    model: ref('dim_customers')
+    entities:
+      - name: customer
+        type: primary
+        expr: customer_id
+    dimensions:
+      - name: gender
+        type: categorical
+      - name: marital_status
+        type: categorical
+      - name: customer_city
+        type: categorical
+      - name: customer_governorate
+        type: categorical
+      - name: customer_segment
+        type: categorical
+      - name: occupation
+        type: categorical
+
+  - name: branches
+    model: ref('dim_branches')
+    entities:
+      - name: branch
+        type: primary
+        expr: branch_id
+    dimensions:
+      - name: branch_name
+        type: categorical
+      - name: branch_city
+        type: categorical
+      - name: branch_governorate
+        type: categorical
+      - name: branch_region
+        type: categorical
+
+  - name: banks
+    model: ref('dim_banks')
+    entities:
+      - name: bank
+        type: primary
+        expr: bank_id
+    dimensions:
+      - name: bank_name
+        type: categorical
+      - name: bank_type
+        type: categorical
+
+  # ---- Data quality --------------------------------------------------
+  # Time is the day the run's file was ingested (run_date).
+
+  - name: dq_runs
+    description: One row per validated run, with its current DQ figures.
+    model: ref('dq_runs')
+    defaults:
+      agg_time_dimension: run_date
+    entities:
+      - name: dq_run
+        type: primary
+        expr: run_id
+    dimensions:
+      - name: run_date
+        type: time
+        type_params:
+          time_granularity: day
+      - name: run_id
+        type: categorical
+      - name: dataset
+        type: categorical
+      - name: source_file
+        type: categorical
+      - name: schema_version
+        type: categorical
+      - name: rules_version
+        type: categorical
+    measures:
+      - name: dq_run_count
+        description: Validated runs.
+        agg: count
+        expr: run_id
+      - name: processed_records
+        description: Records validated (input minus exact duplicate rows).
+        agg: sum
+        expr: processed
+      - name: valid_records
+        description: Records accepted on the first validation.
+        agg: sum
+        expr: valid
+      - name: auto_fixed_records
+        description: Valid records that needed at least one automatic repair.
+        agg: sum
+      - name: quarantined_records
+        description: Records that failed the first validation.
+        agg: sum
+        expr: quarantined
+      - name: records_with_issues
+        description: Auto-fixed + quarantined records.
+        agg: sum
+      - name: resolved_records
+        description: Quarantined records that passed re-validation.
+        agg: sum
+        expr: resolved
+      - name: clean_records
+        description: Valid + resolved records (what reaches the clean data).
+        agg: sum
+      - name: manually_fixed_records
+        description: Quarantined records corrected by hand and resolved.
+        agg: sum
+      - name: confirmed_records
+        description: Records held for many automatic repairs, accepted by a person and resolved.
+        agg: sum
+      - name: discarded_records
+        description: Quarantined records discarded by a person or removed as duplicates.
+        agg: sum
+        expr: discarded
+      - name: unresolved_records
+        description: Quarantined records still open or waiting for an expert.
+        agg: sum
+
+  - name: dq_rule_checks
+    description: One row per run and rule of the first validation.
+    model: ref('dq_rule_checks')
+    defaults:
+      agg_time_dimension: run_date
+    entities:
+      - name: rule_check
+        type: primary
+        expr: rule_check_id
+      - name: dq_run
+        type: foreign
+        expr: run_id
+    dimensions:
+      - name: run_date
+        type: time
+        type_params:
+          time_granularity: day
+      - name: rule_id
+        type: categorical
+      - name: rule_name
+        type: categorical
+      - name: rule_type
+        type: categorical
+      - name: column_name
+        type: categorical
+      - name: dq_dimension
+        type: categorical
+      - name: severity
+        type: categorical
+      - name: error_code
+        type: categorical
+      - name: origin
+        type: categorical
+    measures:
+      - name: values_checked
+        description: Values a rule checked.
+        agg: sum
+        expr: checked
+      - name: values_failed
+        description: Values that failed a rule.
+        agg: sum
+        expr: failed
+      - name: values_repaired
+        description: Failed values repaired automatically.
+        agg: sum
+        expr: repaired

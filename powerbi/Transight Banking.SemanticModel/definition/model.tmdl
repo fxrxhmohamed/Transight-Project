@@ -1,0 +1,28 @@
+model Model
+	culture: en-US
+	defaultPowerBIDataSourceVersion: powerBI_V3
+	sourceQueryCulture: en-US
+	dataAccessOptions
+		legacyRedirects
+		returnErrorValuesAsNull
+
+annotation __PBI_TimeIntelligenceEnabled = 0
+
+annotation PBI_QueryOrder = ["PgServer","PgDatabase","fact_transaction","dim_date","dim_customer","dim_account","dim_branch","dim_bank","dq_runs","dq_run_rounds","dq_rule_checks","dq_correction_summary","dq_quarantine_status"]
+
+annotation PBI_ProTooling = ["MCP-PBIModeling","DevMode"]
+
+ref table fact_transaction
+ref table dim_date
+ref table dim_customer
+ref table dim_account
+ref table dim_branch
+ref table dim_bank
+ref table dq_runs
+ref table dq_run_rounds
+ref table dq_rule_checks
+ref table dq_correction_summary
+ref table dq_quarantine_status
+
+ref cultureInfo en-US
+

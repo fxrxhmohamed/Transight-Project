@@ -1,0 +1,198 @@
+{
+  "$schema": "https://developer.microsoft.com/json-schemas/fabric/item/report/definition/visualContainer/2.13.0/schema.json",
+  "name": "34c43a8c262a5357b97c",
+  "position": {
+    "x": 664,
+    "y": 490,
+    "z": 18000,
+    "height": 118,
+    "width": 600,
+    "tabOrder": 18000
+  },
+  "visual": {
+    "visualType": "tableEx",
+    "query": {
+      "queryState": {
+        "Values": {
+          "projections": [
+            {
+              "field": {
+                "Column": {
+                  "Expression": {
+                    "SourceRef": {
+                      "Entity": "dq_run_rounds"
+                    }
+                  },
+                  "Property": "run_id"
+                }
+              },
+              "queryRef": "dq_run_rounds.run_id",
+              "nativeQueryRef": "run_id",
+              "displayName": "Run"
+            },
+            {
+              "field": {
+                "Column": {
+                  "Expression": {
+                    "SourceRef": {
+                      "Entity": "dq_run_rounds"
+                    }
+                  },
+                  "Property": "round"
+                }
+              },
+              "queryRef": "dq_run_rounds.round",
+              "nativeQueryRef": "round",
+              "displayName": "Round"
+            },
+            {
+              "field": {
+                "Column": {
+                  "Expression": {
+                    "SourceRef": {
+                      "Entity": "dq_run_rounds"
+                    }
+                  },
+                  "Property": "round_type"
+                }
+              },
+              "queryRef": "dq_run_rounds.round_type",
+              "nativeQueryRef": "round_type",
+              "displayName": "Type"
+            },
+            {
+              "field": {
+                "Column": {
+                  "Expression": {
+                    "SourceRef": {
+                      "Entity": "dq_run_rounds"
+                    }
+                  },
+                  "Property": "finished_at"
+                }
+              },
+              "queryRef": "dq_run_rounds.finished_at",
+              "nativeQueryRef": "finished_at",
+              "displayName": "Finished"
+            },
+            {
+              "field": {
+                "Column": {
+                  "Expression": {
+                    "SourceRef": {
+                      "Entity": "dq_run_rounds"
+                    }
+                  },
+                  "Property": "round_revalidated"
+                }
+              },
+              "queryRef": "dq_run_rounds.round_revalidated",
+              "nativeQueryRef": "round_revalidated",
+              "displayName": "Revalidated"
+            },
+            {
+              "field": {
+                "Column": {
+                  "Expression": {
+                    "SourceRef": {
+                      "Entity": "dq_run_rounds"
+                    }
+                  },
+                  "Property": "round_resolved"
+                }
+              },
+              "queryRef": "dq_run_rounds.round_resolved",
+              "nativeQueryRef": "round_resolved",
+              "displayName": "Resolved"
+            },
+            {
+              "field": {
+                "Column": {
+                  "Expression": {
+                    "SourceRef": {
+                      "Entity": "dq_run_rounds"
+                    }
+                  },
+                  "Property": "round_failed_again"
+                }
+              },
+              "queryRef": "dq_run_rounds.round_failed_again",
+              "nativeQueryRef": "round_failed_again",
+              "displayName": "Failed again"
+            },
+            {
+              "field": {
+                "Column": {
+                  "Expression": {
+                    "SourceRef": {
+                      "Entity": "dq_run_rounds"
+                    }
+                  },
+                  "Property": "unresolved_records"
+                }
+              },
+              "queryRef": "dq_run_rounds.unresolved_records",
+              "nativeQueryRef": "unresolved_records",
+              "displayName": "Unresolved"
+            },
+            {
+              "field": {
+                "Column": {
+                  "Expression": {
+                    "SourceRef": {
+                      "Entity": "dq_run_rounds"
+                    }
+                  },
+                  "Property": "final_dq_score"
+                }
+              },
+              "queryRef": "dq_run_rounds.final_dq_score",
+              "nativeQueryRef": "final_dq_score",
+              "displayName": "Final DQ score"
+            }
+          ]
+        }
+      },
+      "sortDefinition": {
+        "sort": [
+          {
+            "field": {
+              "Column": {
+                "Expression": {
+                  "SourceRef": {
+                    "Entity": "dq_run_rounds"
+                  }
+                },
+                "Property": "finished_at"
+              }
+            },
+            "direction": "Ascending"
+          }
+        ]
+      }
+    },
+    "visualContainerObjects": {
+      "title": [
+        {
+          "properties": {
+            "show": {
+              "expr": {
+                "Literal": {
+                  "Value": "true"
+                }
+              }
+            },
+            "text": {
+              "expr": {
+                "Literal": {
+                  "Value": "'Pipeline run history (validation and correction rounds)'"
+                }
+              }
+            }
+          }
+        }
+      ]
+    },
+    "drillFilterOtherVisuals": true
+  }
+}

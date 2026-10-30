@@ -4,21 +4,22 @@ Every task runs one step of dq.py (python dq.py <step> ...), so a task
 does in Airflow exactly what the same command does by hand.
 
     dq_ingest_validate    ingest -> profile -> validate -> merge -> metrics
-                          -> metadata -> gold
+                          -> metadata -> gold -> semantic -> powerbi
                           A new source file: land it, check it, publish the
                           valid records (incremental load into silver).
                           Triggered by the correction UI ("Load new data",
                           files saved under data/raw/uploads/), or by hand
                           with {"input": "<csv path>"}. One run at a time.
     dq_apply_corrections  import-corrections -> revalidate -> merge -> metrics
-                          -> metadata -> gold
+                          -> metadata -> gold -> semantic -> powerbi
                           A filled-in correction file for a run. Triggered by
                           the correction UI when someone sends an uploaded
                           file (saved under data/corrections/), or by hand with
                           {"run": "<ingestion id>", "file": "<csv path>",
                           "user": "<who corrected>"}. One run at a time, so
                           two uploads are applied one after the other.
-    dq_publish            merge -> metrics -> metadata -> gold, every evening
+    dq_publish            merge -> metrics -> metadata -> gold -> semantic
+                          -> powerbi, every evening
                           Puts the records fixed in the correction UI that
                           day into the clean data and the gold star schema.
                           Also triggered by "Publish to clean data" in the
@@ -26,8 +27,12 @@ does in Airflow exactly what the same command does by hand.
                           "user": "<who published>"}. One run at a time.
 
 The data work of the steps runs on Spark: the tasks submit their jobs to
-the cluster named by SPARK_MASTER (docker-compose.yml). metrics updates
-the metric views in PostgreSQL (sql/04_metrics.sql).
+the cluster named by SPARK_MASTER (docker-compose.yml). metrics loads
+the DQ tables of the semantic layer (dbt: semantic.dq_*); semantic
+computes the business and DQ metrics (dbt + MetricFlow) and stores them in
+the semantic schema; powerbi refreshes the Power BI semantic model from PostgreSQL, so
+the reports show the run's data when the run ends. Without the POWERBI_*
+settings (.env) it exits with 99 and Airflow marks it skipped.
 
 Environment of the Airflow workers
     METAFLOW_HOME    project folder holding dq.py and config/
@@ -36,12 +41,16 @@ Environment of the Airflow workers
                      (default python)
     SPARK_MASTER     spark://spark-master:7077, or local[*]
     POSTGRES_*       the database every step reads and writes
+    DQ_ALERT_EMAIL,  e-mail on every run: success, or the failed task with
+    SMTP_*           its error (dq_notify.py; unset: no e-mail)
 """
 
 from __future__ import annotations
 
 import os
 from datetime import datetime, timedelta
+
+import dq_notify
 
 try:  # Airflow 3
     from airflow.providers.standard.operators.bash import BashOperator
@@ -59,6 +68,8 @@ DEFAULT_ARGS = {
     "owner": "data-quality",
     "retries": 1,
     "retry_delay": timedelta(minutes=5),
+    # E-mail when a task fails for good (after its retry).
+    "on_failure_callback": dq_notify.task_failed,
 }
 
 
@@ -87,6 +98,7 @@ with DAG(
     is_paused_upon_creation=False,
     max_active_runs=1,
     default_args=DEFAULT_ARGS,
+    on_success_callback=dq_notify.dag_succeeded,
     params={"input": Param("data/raw/banking/banking_transactions.csv", type="string",
                            description="Source CSV, relative to METAFLOW_HOME.")},
     tags=["data-quality"],
@@ -104,8 +116,10 @@ with DAG(
     metrics = task("metrics", "metrics")
     metadata = task("metadata", "metadata")
     gold = task("gold", "gold")
+    semantic = task("semantic", "semantic")
+    powerbi = task("powerbi", "powerbi-refresh")
 
-    ingest >> profile >> validate >> merge >> metrics >> metadata >> gold
+    ingest >> profile >> validate >> merge >> metrics >> metadata >> gold >> semantic >> powerbi
 
 
 with DAG(
@@ -118,6 +132,7 @@ with DAG(
     is_paused_upon_creation=False,
     max_active_runs=1,
     default_args=DEFAULT_ARGS,
+    on_success_callback=dq_notify.dag_succeeded,
     params={
         "run": Param("latest", type="string", description="Ingestion id."),
         "file": Param("", type="string",
@@ -141,8 +156,10 @@ with DAG(
     measured = task("metrics", "metrics")
     described = task("metadata", "metadata")
     built = task("gold", "gold")
+    computed = task("semantic", "semantic")
+    refreshed = task("powerbi", "powerbi-refresh")
 
-    imported >> revalidated >> merged >> measured >> described >> built
+    imported >> revalidated >> merged >> measured >> described >> built >> computed >> refreshed
 
 
 with DAG(
@@ -156,6 +173,7 @@ with DAG(
     is_paused_upon_creation=False,
     max_active_runs=1,
     default_args=DEFAULT_ARGS,
+    on_success_callback=dq_notify.dag_succeeded,
     params={
         "run": Param("latest", type="string", description="Ingestion id."),
         "user": Param("", type="string",
@@ -168,4 +186,8 @@ with DAG(
     merged = task("merge", "merge", '--run "$DQ_RUN" --published-by "$DQ_USER"',
                   env={"DQ_RUN": "{{ params.run }}", "DQ_USER": "{{ params.user }}"},
                   append_env=True)
-    merged >> task("metrics", "metrics") >> task("metadata", "metadata") >> task("gold", "gold")
+    (
+        merged >> task("metrics", "metrics") >> task("metadata", "metadata")
+        >> task("gold", "gold") >> task("semantic", "semantic")
+        >> task("powerbi", "powerbi-refresh")
+    )

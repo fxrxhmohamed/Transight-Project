@@ -248,7 +248,7 @@ def test_counts(run: Run) -> None:
 def metrics_table(database: str, table: str, run_id: str) -> pd.DataFrame:
     with connect(database) as conn:
         cursor = conn.execute(
-            f"SELECT * FROM metrics.{table} WHERE run_id = %s", (run_id,),
+            f"SELECT * FROM semantic.{table} WHERE run_id = %s", (run_id,),
         )
         return pd.DataFrame(cursor.fetchall(),
                             columns=[column.name for column in cursor.description])
@@ -372,6 +372,91 @@ def test_metadata_and_gold(run: Run, database: str) -> None:
     assert first <= lo and last >= hi and days == (last - first).days + 1
 
 
+def test_semantic_layer_metrics_are_stored(run: Run, database: str) -> None:
+    """dbt + MetricFlow compute the metrics from gold and the DQ tables;
+    they match gold and the DQ tables."""
+
+    stored = dq("semantic")
+    assert "headline" in stored.stdout
+
+    headlines = dict(query(database, """
+        SELECT area = 'Data Quality', count(*) FILTER (WHERE headline)
+        FROM semantic.metric_definition GROUP BY 1"""))
+    assert headlines == {False: 15, True: 10}
+    definitions = {metric for (metric,) in query(database,
+                                                 "SELECT metric FROM semantic.metric_definition")}
+    assert {"transactions", "digital_share", "potential_cost_savings_egp",
+            "failure_rate", "transaction_value_egp_yoy_growth",
+            "initial_dq_score", "final_dq_score", "auto_fix_rate",
+            "rule_failure_rate"} <= definitions
+
+    def total(metric: str) -> float:
+        [(value,)] = query(database, "SELECT value FROM semantic.metric_value "
+                                     "WHERE metric = %s AND grain = 'total'", metric)
+        return float(value)
+
+    [(facts, value, failed, digital, customers)] = query(database, """
+        SELECT count(*), sum(amount_egp) FILTER (WHERE transaction_status = 'Completed'),
+               avg((transaction_status = 'Failed')::int),
+               avg(coalesce(digital_channel_flag, false)::int), count(DISTINCT customer_id)
+        FROM gold.fact_transaction""")
+    assert total("transactions") == facts
+    assert total("transaction_value_egp") == pytest.approx(float(value), abs=0.01)
+    assert total("failure_rate") == pytest.approx(float(failed), abs=1e-6)
+    assert total("digital_share") == pytest.approx(float(digital), abs=1e-6)
+    assert total("active_customers") == customers
+
+    # Monthly values add up to the total; every month is a calendar month.
+    [(months, monthly)] = query(database, """
+        SELECT count(*), sum(value) FROM semantic.metric_value
+        WHERE metric = 'transactions' AND grain = 'month'""")
+    assert months > 0 and float(monthly) == facts
+    [(reported,)] = query(database, "SELECT count(*) FROM semantic.metric_report")
+    assert reported > 0
+
+    # The rest of the Power BI measures: in the semantic layer too.
+    [(accounts, completed, card, purchases)] = query(database, """
+        SELECT count(DISTINCT account_id), avg((transaction_status = 'Completed')::int),
+               avg((card_type IS NOT NULL)::int),
+               sum(amount_egp) FILTER (WHERE transaction_status = 'Completed'
+                                         AND transaction_type = 'Purchase')
+        FROM gold.fact_transaction""")
+    assert total("active_accounts") == accounts
+    assert total("success_rate") == pytest.approx(float(completed), abs=1e-6)
+    assert total("card_share") == pytest.approx(float(card), abs=1e-6)
+    assert total("purchase_value_egp") == pytest.approx(float(purchases or 0), abs=0.01)
+    assert total("net_flow_egp") == pytest.approx(
+        total("inflow_value_egp") - total("outflow_value_egp"), abs=0.01)
+    # Time-dependent measures are stored per month only.
+    [(ytd_months, ytd_totals)] = query(database, """
+        SELECT count(*) FILTER (WHERE grain = 'month'), count(*) FILTER (WHERE grain = 'total')
+        FROM semantic.metric_value WHERE metric = 'transaction_value_ytd_egp'""")
+    assert ytd_months == months and ytd_totals == 0
+
+    # Data quality: the same figures as the DQ views, in total and per run.
+    [(processed, valid, clean, failed, checked)] = query(database, """
+        SELECT sum(processed), sum(valid), sum(valid + resolved),
+               (SELECT sum(failed) FROM semantic.dq_rule_result WHERE round = 1),
+               (SELECT sum(checked) FROM semantic.dq_rule_result WHERE round = 1)
+        FROM semantic.dq_run WHERE is_latest_round""")
+    assert total("processed_records") == float(processed)
+    assert total("initial_dq_score") == pytest.approx(float(valid) / float(processed), abs=1e-6)
+    assert total("final_dq_score") == pytest.approx(float(clean) / float(processed), abs=1e-6)
+    assert total("rule_failure_rate") == pytest.approx(float(failed) / float(checked), abs=1e-6)
+
+    per_run = dict(query(database, """
+        SELECT metric, value FROM semantic.metric_value
+        WHERE grain = 'run' AND run_id = %s""", run.run_id))
+    [latest] = metrics_table(database, "dq_run", run.run_id).query("is_latest_round").to_dict(
+        "records")
+    assert float(per_run["initial_dq_score"]) == pytest.approx(
+        float(latest["initial_dq_score"]), abs=1e-6)
+    assert float(per_run["final_dq_score"]) == pytest.approx(
+        float(latest["final_dq_score"]), abs=1e-6)
+    assert float(per_run["unresolved_records"]) == latest["unresolved_records"]
+    assert float(per_run["dq_score_uplift"]) > 0
+
+
 # ============================================================
 # Correction UI and Airflow
 # ============================================================
@@ -411,7 +496,82 @@ def test_airflow_dags_only_call_known_steps() -> None:
         and len(node.args) > 1 and isinstance(node.args[1], ast.Constant)
     }
     assert {"ingest", "profile", "validate", "import-corrections",
-            "revalidate", "merge", "metrics", "metadata", "gold"} <= steps
+            "revalidate", "merge", "metrics", "metadata", "gold", "semantic",
+            "powerbi-refresh"} <= steps
     for step in steps:
         extra = ["--file", "x.csv"] if step == "import-corrections" else []
         assert parse_args([step, *extra]).step == step
+
+
+def test_powerbi_refresh_is_skipped_when_not_configured() -> None:
+    """Without the POWERBI_* settings the step exits with 99, which Airflow
+    reports as skipped, so the DAGs run without Power BI."""
+
+    env = {k: v for k, v in os.environ.items() if not k.startswith("POWERBI_")}
+    result = subprocess.run(
+        [sys.executable, str(ROOT / "services" / "etl-service" / "src" / "powerbi.py")],
+        cwd=ROOT, env=env, capture_output=True, text=True,
+    )
+    assert result.returncode == 99, result.stdout + result.stderr
+    assert "not configured" in result.stdout
+
+
+def test_airflow_emails_success_and_failure(monkeypatch) -> None:
+    """dq_notify sends one e-mail per outcome to DQ_ALERT_EMAIL, and none
+    without the SMTP settings."""
+
+    from datetime import datetime, timezone
+    from types import SimpleNamespace
+
+    sys.path.insert(0, str(ROOT / "airflow" / "dags"))
+    import dq_notify
+
+    sent = []
+
+    class FakeSMTP:
+        def __init__(self, host, port, timeout):
+            assert (host, port) == ("smtp.example.com", 587)
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+        def starttls(self, context):
+            pass
+
+        def login(self, user, password):
+            assert (user, password) == ("sender@example.com", "app-password")
+
+        def send_message(self, message):
+            sent.append(message)
+
+    monkeypatch.setattr(dq_notify.smtplib, "SMTP", FakeSMTP)
+    for key in ("DQ_ALERT_EMAIL", "SMTP_USER", "SMTP_PASSWORD"):
+        monkeypatch.delenv(key, raising=False)
+
+    start = datetime(2026, 10, 13, 18, 0, tzinfo=timezone.utc)
+    run = SimpleNamespace(dag_id="dq_publish", run_id="scheduled__2026-10-13T18:00:00+00:00",
+                          start_date=start, end_date=start.replace(minute=26), conf={})
+    dq_notify.dag_succeeded({"dag_run": run})
+    assert not sent   # not configured: nothing sent
+
+    monkeypatch.setenv("DQ_ALERT_EMAIL", "owner@example.com")
+    monkeypatch.setenv("SMTP_HOST", "smtp.example.com")
+    monkeypatch.setenv("SMTP_PORT", "587")
+    monkeypatch.setenv("SMTP_USER", "sender@example.com")
+    monkeypatch.setenv("SMTP_PASSWORD", "app-password")
+
+    dq_notify.dag_succeeded({"dag_run": run})
+    ti = SimpleNamespace(dag_id="dq_publish", task_id="merge", run_id=run.run_id, try_number=2)
+    dq_notify.task_failed({"ti": ti, "dag_run": run,
+                           "exception": RuntimeError("exit code 2")})
+
+    success, failure = sent
+    assert success["To"] == "owner@example.com"
+    assert success["Subject"] == "[Transight] SUCCESS: dq_publish"
+    assert "0h 26m 0s" in success.get_content()
+    assert failure["Subject"] == "[Transight] FAILED: dq_publish (task merge)"
+    assert "exit code 2" in failure.get_content()
+    assert "/dags/dq_publish/runs/" in failure.get_content()

@@ -1,0 +1,1329 @@
+# Metrics of the semantic layer (MetricFlow): the business metrics over
+# gold and the data-quality metrics over the validated runs (at the end).
+#
+# The question behind the business metrics: how can the bank serve its
+# transactions more cheaply and reliably by moving customers from assisted
+# channels (ATM, Branch, Call Center, POS: about 16 EGP per transaction)
+# to digital ones (Mobile App, Internet Banking, InstaPay: about 1 EGP)?
+# The data-quality metrics answer how far those numbers can be trusted.
+#
+# The headline metrics (15 business, 10 data quality) have
+# meta.headline: true; the others are the inputs they are built from.
+# Counts and sums are 0, not null, when nothing matches (fill_nulls_with),
+# so e.g. a month without failures has a failure rate of 0. Money is in
+# EGP; "value" means completed transactions; ratios are sum / sum. The
+# business metrics match the Power BI measures of the same name in
+# semantic/fact_transaction_measures.dax.
+#
+# "python dq.py semantic" stores every metric in PostgreSQL:
+# semantic.metric_definition (what it is) and semantic.metric_value (per
+# month and in total, and the data-quality metrics per run). Ad hoc,
+# inside dbt/:
+#
+#   mf query --metrics digital_share,potential_cost_savings_egp --group-by metric_time__month
+#   mf query --metrics digital_adoption_rate --group-by customer__customer_segment
+
+metrics:
+
+  # ---------------------------------------------------------------
+  # Volume and value
+  # ---------------------------------------------------------------
+  - name: transactions
+    label: Transactions
+    description: Every transaction, whatever its status.
+    type: simple
+    type_params:
+      measure:
+        name: transaction_count
+        fill_nulls_with: 0
+    config:
+      meta: {headline: true, unit: count, area: Volume & Value}
+
+  - name: completed_transactions
+    label: Completed transactions
+    type: simple
+    type_params:
+      measure:
+        name: transaction_count
+        fill_nulls_with: 0
+    filter: "{{ Dimension('transaction__is_completed') }} = true"
+    config:
+      meta: {headline: false, unit: count, area: Volume & Value}
+
+  - name: transaction_value_egp
+    label: Transaction value (EGP)
+    description: Amount of the completed transactions, in EGP.
+    type: simple
+    type_params:
+      measure:
+        name: amount_egp
+        fill_nulls_with: 0
+    filter: "{{ Dimension('transaction__is_completed') }} = true"
+    config:
+      meta: {headline: true, unit: EGP, area: Volume & Value}
+
+  - name: avg_transaction_value_egp
+    label: Average transaction value (EGP)
+    description: Transaction value per completed transaction.
+    type: ratio
+    type_params:
+      numerator: transaction_value_egp
+      denominator: completed_transactions
+    config:
+      meta: {headline: true, unit: EGP, area: Volume & Value}
+
+  - name: transaction_value_egp_yoy_growth
+    label: Transaction value growth (YoY)
+    description: Transaction value against the same period a year earlier.
+    type: derived
+    type_params:
+      expr: (transaction_value_egp - transaction_value_egp_py) / nullif(transaction_value_egp_py, 0)
+      metrics:
+        - name: transaction_value_egp
+        - name: transaction_value_egp
+          offset_window: 1 year
+          alias: transaction_value_egp_py
+    config:
+      meta: {headline: true, unit: rate, area: Volume & Value}
+
+  # ---------------------------------------------------------------
+  # Revenue and cost
+  # ---------------------------------------------------------------
+  - name: fee_revenue_egp
+    label: Fee revenue (EGP)
+    description: Fees of the completed transactions, converted to EGP.
+    type: simple
+    type_params:
+      measure:
+        name: fee_egp
+        fill_nulls_with: 0
+    filter: "{{ Dimension('transaction__is_completed') }} = true"
+    config:
+      meta: {headline: true, unit: EGP, area: Revenue & Cost}
+
+  - name: channel_cost_egp
+    label: Channel cost (EGP)
+    description: Estimated cost to the bank of serving the transactions.
+    type: simple
+    type_params:
+      measure:
+        name: channel_cost_egp
+        fill_nulls_with: 0
+    config:
+      meta: {headline: true, unit: EGP, area: Revenue & Cost}
+
+  - name: cost_per_transaction_egp
+    label: Cost per transaction (EGP)
+    type: ratio
+    type_params:
+      numerator: channel_cost_egp
+      denominator: transactions
+    config:
+      meta: {headline: true, unit: EGP, area: Revenue & Cost}
+
+  - name: fee_coverage_of_channel_cost
+    label: Fee coverage of channel cost
+    description: Fee revenue / channel cost; below 1, fees do not pay for serving the transactions.
+    type: ratio
+    type_params:
+      numerator: fee_revenue_egp
+      denominator: channel_cost_egp
+    config:
+      meta: {headline: true, unit: rate, area: Revenue & Cost}
+
+  # ---------------------------------------------------------------
+  # Digital adoption
+  # ---------------------------------------------------------------
+  - name: digital_transactions
+    label: Digital transactions
+    type: simple
+    type_params:
+      measure:
+        name: transaction_count
+        fill_nulls_with: 0
+    filter: "{{ Dimension('transaction__digital_channel_flag') }} = true"
+    config:
+      meta: {headline: false, unit: count, area: Digital Adoption}
+
+  - name: digital_share
+    label: Digital share
+    description: Share of the transactions made on a digital channel.
+    type: ratio
+    type_params:
+      numerator: digital_transactions
+      denominator: transactions
+    config:
+      meta: {headline: true, unit: rate, area: Digital Adoption}
+
+  - name: active_customers
+    label: Active customers
+    description: Distinct customers with at least one transaction.
+    type: simple
+    type_params:
+      measure:
+        name: customers_transacting
+        fill_nulls_with: 0
+    config:
+      meta: {headline: true, unit: count, area: Customers}
+
+  - name: digitally_active_customers
+    label: Digitally active customers
+    type: simple
+    type_params:
+      measure:
+        name: customers_transacting
+        fill_nulls_with: 0
+    filter: "{{ Dimension('transaction__digital_channel_flag') }} = true"
+    config:
+      meta: {headline: false, unit: count, area: Digital Adoption}
+
+  - name: digital_adoption_rate
+    label: Digital adoption rate
+    description: Share of the active customers who used a digital channel.
+    type: ratio
+    type_params:
+      numerator: digitally_active_customers
+      denominator: active_customers
+    config:
+      meta: {headline: true, unit: rate, area: Digital Adoption}
+
+  # ---------------------------------------------------------------
+  # Digital migration opportunity
+  # ---------------------------------------------------------------
+  - name: migration_opportunities
+    label: Migration opportunities
+    description: >
+      Transfers, bill payments and loan repayments made at an ATM, branch
+      or call center: transactions that could have been made digitally.
+    type: simple
+    type_params:
+      measure:
+        name: transaction_count
+        fill_nulls_with: 0
+    filter: "{{ Dimension('transaction__digital_migration_opportunity') }} = true"
+    config:
+      meta: {headline: true, unit: count, area: Migration Opportunity}
+
+  - name: migration_opportunity_cost_egp
+    label: Migration opportunity cost (EGP)
+    type: simple
+    type_params:
+      measure:
+        name: channel_cost_egp
+        fill_nulls_with: 0
+    filter: "{{ Dimension('transaction__digital_migration_opportunity') }} = true"
+    config:
+      meta: {headline: false, unit: EGP, area: Migration Opportunity}
+
+  - name: digital_channel_cost_egp
+    label: Digital channel cost (EGP)
+    type: simple
+    type_params:
+      measure:
+        name: channel_cost_egp
+        fill_nulls_with: 0
+    filter: "{{ Dimension('transaction__digital_channel_flag') }} = true"
+    config:
+      meta: {headline: false, unit: EGP, area: Migration Opportunity}
+
+  - name: digital_cost_per_transaction_egp
+    label: Digital cost per transaction (EGP)
+    type: ratio
+    type_params:
+      numerator: digital_channel_cost_egp
+      denominator: digital_transactions
+    config:
+      meta: {headline: false, unit: EGP, area: Migration Opportunity}
+
+  - name: potential_cost_savings_egp
+    label: Potential cost savings (EGP)
+    description: >
+      What the migration opportunities cost today minus what they would
+      cost at the digital cost per transaction. Group by time or customer
+      attributes only: grouped by channel there is no digital cost to
+      compare with.
+    type: derived
+    type_params:
+      expr: greatest(0, migration_opportunity_cost_egp - migration_opportunities * digital_cost_per_transaction_egp)
+      metrics:
+        - name: migration_opportunity_cost_egp
+        - name: migration_opportunities
+        - name: digital_cost_per_transaction_egp
+    config:
+      meta: {headline: true, unit: EGP, area: Migration Opportunity}
+
+  # ---------------------------------------------------------------
+  # Reliability
+  # ---------------------------------------------------------------
+  - name: failed_transactions
+    label: Failed transactions
+    type: simple
+    type_params:
+      measure:
+        name: transaction_count
+        fill_nulls_with: 0
+    filter: "{{ Dimension('transaction__transaction_status') }} = 'Failed'"
+    config:
+      meta: {headline: false, unit: count, area: Reliability}
+
+  - name: failure_rate
+    label: Failure rate
+    description: Share of the transactions that failed.
+    type: ratio
+    type_params:
+      numerator: failed_transactions
+      denominator: transactions
+    config:
+      meta: {headline: true, unit: rate, area: Reliability}
+
+  - name: failed_value_egp
+    label: Failed value (EGP)
+    description: Amount of the failed transactions, in EGP (business lost or delayed).
+    type: simple
+    type_params:
+      measure:
+        name: amount_egp
+        fill_nulls_with: 0
+    filter: "{{ Dimension('transaction__transaction_status') }} = 'Failed'"
+    config:
+      meta: {headline: true, unit: EGP, area: Reliability}
+
+  # ---------------------------------------------------------------
+  # Further business metrics: the rest of the Power BI measures
+  # (semantic/fact_transaction_measures.dax), same names in snake case.
+  # Not here: Failure Reason Share % (a share of the failures in the
+  # visual's own failure_reason filter, meaningful only in Power BI).
+  # ---------------------------------------------------------------
+
+  - name: attempted_value_egp
+    label: Attempted value (EGP)
+    description: Amount of every transaction in EGP, whatever its status.
+    type: simple
+    type_params:
+      measure:
+        name: amount_egp
+        fill_nulls_with: 0
+    config:
+      meta: {headline: false, unit: EGP, area: Volume & Value}
+
+  - name: median_transaction_value_egp
+    label: Median transaction value (EGP)
+    type: simple
+    type_params:
+      measure:
+        name: median_amount_egp
+    filter: "{{ Dimension('transaction__is_completed') }} = true"
+    config:
+      meta: {headline: false, unit: EGP, area: Volume & Value}
+
+  - name: inflow_value_egp
+    label: Inflow value (EGP)
+    description: Completed deposits and interest credits.
+    type: simple
+    type_params:
+      measure:
+        name: amount_egp
+        fill_nulls_with: 0
+    filter: "{{ Dimension('transaction__is_completed') }} = true and {{ Dimension('transaction__transaction_type') }} in ('Deposit', 'Interest Credit')"
+    config:
+      meta: {headline: false, unit: EGP, area: Volume & Value}
+
+  - name: outflow_value_egp
+    label: Outflow value (EGP)
+    description: Completed withdrawals, purchases, transfers, bill payments, fees and loan repayments (the data has no transfer direction).
+    type: simple
+    type_params:
+      measure:
+        name: amount_egp
+        fill_nulls_with: 0
+    filter: "{{ Dimension('transaction__is_completed') }} = true and {{ Dimension('transaction__transaction_type') }} in ('Withdrawal', 'Purchase', 'Transfer', 'Bill Payment', 'Fee', 'Loan Repayment')"
+    config:
+      meta: {headline: false, unit: EGP, area: Volume & Value}
+
+  - name: net_flow_egp
+    label: Net flow (EGP)
+    type: derived
+    type_params:
+      expr: inflow_value_egp - outflow_value_egp
+      metrics:
+        - name: inflow_value_egp
+        - name: outflow_value_egp
+    config:
+      meta: {headline: false, unit: EGP, area: Volume & Value}
+
+  - name: foreign_currency_value_egp
+    label: Foreign currency value (EGP)
+    type: simple
+    type_params:
+      measure:
+        name: amount_egp
+        fill_nulls_with: 0
+    filter: "{{ Dimension('transaction__is_completed') }} = true and {{ Dimension('transaction__currency') }} <> 'EGP'"
+    config:
+      meta: {headline: false, unit: EGP, area: Volume & Value}
+
+  - name: foreign_currency_value_share
+    label: Foreign currency value share
+    type: ratio
+    type_params:
+      numerator: foreign_currency_value_egp
+      denominator: transaction_value_egp
+    config:
+      meta: {headline: false, unit: rate, area: Volume & Value}
+
+  - name: fee_bearing_transactions
+    label: Fee-bearing transactions
+    type: simple
+    type_params:
+      measure:
+        name: transaction_count
+        fill_nulls_with: 0
+    filter: "{{ Dimension('transaction__is_completed') }} = true and {{ Dimension('transaction__has_fee') }} = true"
+    config:
+      meta: {headline: false, unit: count, area: Revenue & Cost}
+
+  - name: avg_fee_per_fee_bearing_transaction_egp
+    label: Average fee per fee-bearing transaction (EGP)
+    type: ratio
+    type_params:
+      numerator: fee_revenue_egp
+      denominator: fee_bearing_transactions
+    config:
+      meta: {headline: false, unit: EGP, area: Revenue & Cost}
+
+  - name: fee_bearing_value_egp
+    label: Fee-bearing value (EGP)
+    type: simple
+    type_params:
+      measure:
+        name: amount_egp
+        fill_nulls_with: 0
+    filter: "{{ Dimension('transaction__is_completed') }} = true and {{ Dimension('transaction__has_fee') }} = true"
+    config:
+      meta: {headline: false, unit: EGP, area: Revenue & Cost}
+
+  - name: fee_yield
+    label: Fee yield
+    description: Fee revenue / value of the fee-bearing transactions.
+    type: ratio
+    type_params:
+      numerator: fee_revenue_egp
+      denominator: fee_bearing_value_egp
+    config:
+      meta: {headline: false, unit: rate, area: Revenue & Cost}
+
+  - name: cost_per_1k_egp_processed
+    label: Cost per 1K EGP processed
+    type: derived
+    type_params:
+      expr: channel_cost_egp / nullif(transaction_value_egp, 0) * 1000
+      metrics:
+        - name: channel_cost_egp
+        - name: transaction_value_egp
+    config:
+      meta: {headline: false, unit: EGP, area: Revenue & Cost}
+
+  - name: assisted_channel_cost_egp
+    label: Assisted channel cost (EGP)
+    type: simple
+    type_params:
+      measure:
+        name: channel_cost_egp
+        fill_nulls_with: 0
+    filter: "{{ Dimension('transaction__digital_channel_flag') }} = false"
+    config:
+      meta: {headline: false, unit: EGP, area: Revenue & Cost}
+
+  - name: assisted_cost_per_transaction_egp
+    label: Assisted cost per transaction (EGP)
+    type: ratio
+    type_params:
+      numerator: assisted_channel_cost_egp
+      denominator: assisted_transactions
+    config:
+      meta: {headline: false, unit: EGP, area: Revenue & Cost}
+
+  - name: assisted_vs_digital_cost_multiple
+    label: Assisted vs digital cost multiple
+    type: derived
+    type_params:
+      expr: assisted_cost_per_transaction_egp / nullif(digital_cost_per_transaction_egp, 0)
+      metrics:
+        - name: assisted_cost_per_transaction_egp
+        - name: digital_cost_per_transaction_egp
+    config:
+      meta: {headline: false, unit: multiple, area: Revenue & Cost}
+
+  - name: cost_of_failed_transactions_egp
+    label: Cost of failed transactions (EGP)
+    type: simple
+    type_params:
+      measure:
+        name: channel_cost_egp
+        fill_nulls_with: 0
+    filter: "{{ Dimension('transaction__transaction_status') }} = 'Failed'"
+    config:
+      meta: {headline: false, unit: EGP, area: Revenue & Cost}
+
+  - name: assisted_transactions
+    label: Assisted transactions
+    type: simple
+    type_params:
+      measure:
+        name: transaction_count
+        fill_nulls_with: 0
+    filter: "{{ Dimension('transaction__digital_channel_flag') }} = false"
+    config:
+      meta: {headline: false, unit: count, area: Digital Adoption}
+
+  - name: digital_value_egp
+    label: Digital value (EGP)
+    type: simple
+    type_params:
+      measure:
+        name: amount_egp
+        fill_nulls_with: 0
+    filter: "{{ Dimension('transaction__is_completed') }} = true and {{ Dimension('transaction__digital_channel_flag') }} = true"
+    config:
+      meta: {headline: false, unit: EGP, area: Digital Adoption}
+
+  - name: digital_value_share
+    label: Digital value share
+    type: ratio
+    type_params:
+      numerator: digital_value_egp
+      denominator: transaction_value_egp
+    config:
+      meta: {headline: false, unit: rate, area: Digital Adoption}
+
+  - name: assisted_only_customers
+    label: Assisted-only customers
+    description: "Customers who never used a digital channel: the audience for digital onboarding."
+    type: derived
+    type_params:
+      expr: active_customers - digitally_active_customers
+      metrics:
+        - name: active_customers
+        - name: digitally_active_customers
+    config:
+      meta: {headline: false, unit: count, area: Digital Adoption}
+
+  - name: digital_logins_succeeded
+    label: Digital logins succeeded
+    type: simple
+    type_params:
+      measure:
+        name: transaction_count
+        fill_nulls_with: 0
+    filter: "{{ Dimension('transaction__digital_channel_flag') }} = true and {{ Dimension('transaction__login_success') }} = true"
+    config:
+      meta: {headline: false, unit: count, area: Digital Adoption}
+
+  - name: digital_logins
+    label: Digital logins
+    type: simple
+    type_params:
+      measure:
+        name: transaction_count
+        fill_nulls_with: 0
+    filter: "{{ Dimension('transaction__digital_channel_flag') }} = true and {{ Dimension('transaction__login_success') }} is not null"
+    config:
+      meta: {headline: false, unit: count, area: Digital Adoption}
+
+  - name: digital_login_success_rate
+    label: Digital login success rate
+    type: ratio
+    type_params:
+      numerator: digital_logins_succeeded
+      denominator: digital_logins
+    config:
+      meta: {headline: false, unit: rate, area: Digital Adoption}
+
+  - name: avg_digital_session_min
+    label: Average digital session (min)
+    type: simple
+    type_params:
+      measure:
+        name: avg_session_minutes
+    filter: "{{ Dimension('transaction__digital_channel_flag') }} = true"
+    config:
+      meta: {headline: false, unit: minutes, area: Digital Adoption}
+
+  - name: migration_opportunity_rate
+    label: Migration opportunity rate
+    type: ratio
+    type_params:
+      numerator: migration_opportunities
+      denominator: assisted_transactions
+    config:
+      meta: {headline: false, unit: rate, area: Migration Opportunity}
+
+  - name: migration_opportunity_value_egp
+    label: Migration opportunity value (EGP)
+    type: simple
+    type_params:
+      measure:
+        name: amount_egp
+        fill_nulls_with: 0
+    filter: "{{ Dimension('transaction__is_completed') }} = true and {{ Dimension('transaction__digital_migration_opportunity') }} = true"
+    config:
+      meta: {headline: false, unit: EGP, area: Migration Opportunity}
+
+  - name: customers_with_migration_opportunity
+    label: Customers with migration opportunity
+    type: simple
+    type_params:
+      measure:
+        name: customers_transacting
+        fill_nulls_with: 0
+    filter: "{{ Dimension('transaction__digital_migration_opportunity') }} = true"
+    config:
+      meta: {headline: false, unit: count, area: Migration Opportunity}
+
+  - name: potential_savings_share_of_channel_cost
+    label: Potential savings share of channel cost
+    type: derived
+    type_params:
+      expr: potential_cost_savings_egp / nullif(channel_cost_egp, 0)
+      metrics:
+        - name: potential_cost_savings_egp
+        - name: channel_cost_egp
+    config:
+      meta: {headline: false, unit: rate, area: Migration Opportunity}
+
+  - name: savings_per_migrated_customer_egp
+    label: Savings per migrated customer (EGP)
+    type: derived
+    type_params:
+      expr: potential_cost_savings_egp / nullif(customers_with_migration_opportunity, 0)
+      metrics:
+        - name: potential_cost_savings_egp
+        - name: customers_with_migration_opportunity
+    config:
+      meta: {headline: false, unit: EGP, area: Migration Opportunity}
+
+  - name: digital_share_if_migrated
+    label: Digital share if migrated
+    description: "Digital share once every opportunity has moved: the target state."
+    type: derived
+    type_params:
+      expr: (digital_transactions + migration_opportunities) / nullif(transactions, 0)
+      metrics:
+        - name: digital_transactions
+        - name: migration_opportunities
+        - name: transactions
+    config:
+      meta: {headline: false, unit: rate, area: Migration Opportunity}
+
+  - name: reversed_transactions
+    label: Reversed transactions
+    type: simple
+    type_params:
+      measure:
+        name: transaction_count
+        fill_nulls_with: 0
+    filter: "{{ Dimension('transaction__transaction_status') }} = 'Reversed'"
+    config:
+      meta: {headline: false, unit: count, area: Reliability}
+
+  - name: pending_transactions
+    label: Pending transactions
+    type: simple
+    type_params:
+      measure:
+        name: transaction_count
+        fill_nulls_with: 0
+    filter: "{{ Dimension('transaction__transaction_status') }} = 'Pending'"
+    config:
+      meta: {headline: false, unit: count, area: Reliability}
+
+  - name: success_rate
+    label: Success rate
+    type: ratio
+    type_params:
+      numerator: completed_transactions
+      denominator: transactions
+    config:
+      meta: {headline: false, unit: rate, area: Reliability}
+
+  - name: reversal_rate
+    label: Reversal rate
+    type: ratio
+    type_params:
+      numerator: reversed_transactions
+      denominator: transactions
+    config:
+      meta: {headline: false, unit: rate, area: Reliability}
+
+  - name: pending_rate
+    label: Pending rate
+    type: ratio
+    type_params:
+      numerator: pending_transactions
+      denominator: transactions
+    config:
+      meta: {headline: false, unit: rate, area: Reliability}
+
+  - name: technical_failures
+    label: Technical failures
+    type: simple
+    type_params:
+      measure:
+        name: transaction_count
+        fill_nulls_with: 0
+    filter: "{{ Dimension('transaction__transaction_status') }} = 'Failed' and {{ Dimension('transaction__failure_reason') }} = 'Network Timeout'"
+    config:
+      meta: {headline: false, unit: count, area: Reliability}
+
+  - name: technical_failure_rate
+    label: Technical failure rate
+    type: ratio
+    type_params:
+      numerator: technical_failures
+      denominator: transactions
+    config:
+      meta: {headline: false, unit: rate, area: Reliability}
+
+  - name: authentication_failures
+    label: Authentication failures
+    type: simple
+    type_params:
+      measure:
+        name: transaction_count
+        fill_nulls_with: 0
+    filter: "{{ Dimension('transaction__transaction_status') }} = 'Failed' and {{ Dimension('transaction__failure_reason') }} = 'Authentication Failed'"
+    config:
+      meta: {headline: false, unit: count, area: Reliability}
+
+  - name: authentication_failure_rate
+    label: Authentication failure rate
+    type: ratio
+    type_params:
+      numerator: authentication_failures
+      denominator: transactions
+    config:
+      meta: {headline: false, unit: rate, area: Reliability}
+
+  - name: insufficient_funds_failures
+    label: Insufficient funds failures
+    type: simple
+    type_params:
+      measure:
+        name: transaction_count
+        fill_nulls_with: 0
+    filter: "{{ Dimension('transaction__transaction_status') }} = 'Failed' and {{ Dimension('transaction__failure_reason') }} = 'Insufficient Funds'"
+    config:
+      meta: {headline: false, unit: count, area: Reliability}
+
+  - name: insufficient_funds_rate
+    label: Insufficient funds rate
+    type: ratio
+    type_params:
+      numerator: insufficient_funds_failures
+      denominator: transactions
+    config:
+      meta: {headline: false, unit: rate, area: Reliability}
+
+  - name: avg_attempts_per_transaction
+    label: Average attempts per transaction
+    type: simple
+    type_params:
+      measure:
+        name: avg_attempts
+    config:
+      meta: {headline: false, unit: count, area: Reliability}
+
+  - name: retried_transactions
+    label: Retried transactions
+    type: simple
+    type_params:
+      measure:
+        name: transaction_count
+        fill_nulls_with: 0
+    filter: "{{ Dimension('transaction__is_retried') }} = true"
+    config:
+      meta: {headline: false, unit: count, area: Reliability}
+
+  - name: retried_transactions_share
+    label: Retried transactions share
+    type: ratio
+    type_params:
+      numerator: retried_transactions
+      denominator: transactions
+    config:
+      meta: {headline: false, unit: rate, area: Reliability}
+
+  - name: first_attempt_successes
+    label: First-attempt successes
+    type: simple
+    type_params:
+      measure:
+        name: transaction_count
+        fill_nulls_with: 0
+    filter: "{{ Dimension('transaction__is_first_attempt') }} = true and {{ Dimension('transaction__is_completed') }} = true"
+    config:
+      meta: {headline: false, unit: count, area: Reliability}
+
+  - name: first_attempt_success_rate
+    label: First-attempt success rate
+    type: ratio
+    type_params:
+      numerator: first_attempt_successes
+      denominator: transactions
+    config:
+      meta: {headline: false, unit: rate, area: Reliability}
+
+  - name: active_accounts
+    label: Active accounts
+    type: simple
+    type_params:
+      measure:
+        name: accounts_transacting
+        fill_nulls_with: 0
+    config:
+      meta: {headline: false, unit: count, area: Customers}
+
+  - name: transactions_per_customer
+    label: Transactions per customer
+    type: ratio
+    type_params:
+      numerator: transactions
+      denominator: active_customers
+    config:
+      meta: {headline: false, unit: count, area: Customers}
+
+  - name: value_per_customer_egp
+    label: Value per customer (EGP)
+    type: ratio
+    type_params:
+      numerator: transaction_value_egp
+      denominator: active_customers
+    config:
+      meta: {headline: false, unit: EGP, area: Customers}
+
+  - name: fee_revenue_per_customer_egp
+    label: Fee revenue per customer (EGP)
+    type: ratio
+    type_params:
+      numerator: fee_revenue_egp
+      denominator: active_customers
+    config:
+      meta: {headline: false, unit: EGP, area: Customers}
+
+  - name: channel_cost_per_customer_egp
+    label: Channel cost per customer (EGP)
+    type: ratio
+    type_params:
+      numerator: channel_cost_egp
+      denominator: active_customers
+    config:
+      meta: {headline: false, unit: EGP, area: Customers}
+
+  - name: purchase_value_egp
+    label: Purchase value (EGP)
+    type: simple
+    type_params:
+      measure:
+        name: amount_egp
+        fill_nulls_with: 0
+    filter: "{{ Dimension('transaction__is_completed') }} = true and {{ Dimension('transaction__transaction_type') }} = 'Purchase'"
+    config:
+      meta: {headline: false, unit: EGP, area: Payments & Network}
+
+  - name: completed_purchases
+    label: Completed purchases
+    type: simple
+    type_params:
+      measure:
+        name: transaction_count
+        fill_nulls_with: 0
+    filter: "{{ Dimension('transaction__is_completed') }} = true and {{ Dimension('transaction__transaction_type') }} = 'Purchase'"
+    config:
+      meta: {headline: false, unit: count, area: Payments & Network}
+
+  - name: avg_purchase_ticket_egp
+    label: Average purchase ticket (EGP)
+    type: ratio
+    type_params:
+      numerator: purchase_value_egp
+      denominator: completed_purchases
+    config:
+      meta: {headline: false, unit: EGP, area: Payments & Network}
+
+  - name: bill_payment_value_egp
+    label: Bill payment value (EGP)
+    type: simple
+    type_params:
+      measure:
+        name: amount_egp
+        fill_nulls_with: 0
+    filter: "{{ Dimension('transaction__is_completed') }} = true and {{ Dimension('transaction__transaction_type') }} = 'Bill Payment'"
+    config:
+      meta: {headline: false, unit: EGP, area: Payments & Network}
+
+  - name: active_merchants
+    label: Active merchants
+    type: simple
+    type_params:
+      measure:
+        name: merchants_transacting
+        fill_nulls_with: 0
+    config:
+      meta: {headline: false, unit: count, area: Payments & Network}
+
+  - name: card_transactions
+    label: Card transactions
+    type: simple
+    type_params:
+      measure:
+        name: transaction_count
+        fill_nulls_with: 0
+    filter: "{{ Dimension('transaction__is_card') }} = true"
+    config:
+      meta: {headline: false, unit: count, area: Payments & Network}
+
+  - name: card_share
+    label: Card share
+    type: ratio
+    type_params:
+      numerator: card_transactions
+      denominator: transactions
+    config:
+      meta: {headline: false, unit: rate, area: Payments & Network}
+
+  - name: active_branches
+    label: Active branches
+    type: simple
+    type_params:
+      measure:
+        name: branches_transacting
+        fill_nulls_with: 0
+    config:
+      meta: {headline: false, unit: count, area: Payments & Network}
+
+  - name: transactions_per_branch
+    label: Transactions per branch
+    type: ratio
+    type_params:
+      numerator: transactions
+      denominator: active_branches
+    config:
+      meta: {headline: false, unit: count, area: Payments & Network}
+
+  - name: transaction_value_ytd_egp
+    label: Transaction value YTD (EGP)
+    type: cumulative
+    type_params:
+      measure:
+        name: amount_egp
+      cumulative_type_params:
+        grain_to_date: year
+    filter: "{{ Dimension('transaction__is_completed') }} = true"
+    config:
+      meta: {headline: false, unit: EGP, area: Trends}
+
+  - name: transaction_value_r12m_egp
+    label: Transaction value R12M (EGP)
+    description: Completed value over the last 12 months.
+    type: cumulative
+    type_params:
+      measure:
+        name: amount_egp
+      cumulative_type_params:
+        window: 12 months
+    filter: "{{ Dimension('transaction__is_completed') }} = true"
+    config:
+      meta: {headline: false, unit: EGP, area: Trends}
+
+  - name: transaction_value_py_egp
+    label: Transaction value PY (EGP)
+    type: derived
+    type_params:
+      expr: transaction_value_egp_py
+      metrics:
+        - name: transaction_value_egp
+          offset_window: 1 year
+          alias: transaction_value_egp_py
+    config:
+      meta: {headline: false, unit: EGP, area: Trends}
+
+  - name: transactions_py
+    label: Transactions PY
+    type: derived
+    type_params:
+      expr: transactions_py_value
+      metrics:
+        - name: transactions
+          offset_window: 1 year
+          alias: transactions_py_value
+    config:
+      meta: {headline: false, unit: count, area: Trends}
+
+  - name: transactions_yoy_growth
+    label: Transactions growth (YoY)
+    type: derived
+    type_params:
+      expr: (transactions - transactions_py_value) / nullif(transactions_py_value, 0)
+      metrics:
+        - name: transactions
+        - name: transactions
+          offset_window: 1 year
+          alias: transactions_py_value
+    config:
+      meta: {headline: false, unit: rate, area: Trends}
+
+  - name: transactions_mom_growth
+    label: Transactions growth (MoM)
+    type: derived
+    type_params:
+      expr: (transactions - transactions_pm) / nullif(transactions_pm, 0)
+      metrics:
+        - name: transactions
+        - name: transactions
+          offset_window: 1 month
+          alias: transactions_pm
+    config:
+      meta: {headline: false, unit: rate, area: Trends}
+
+  - name: digital_share_py
+    label: Digital share PY
+    type: derived
+    type_params:
+      expr: digital_share_py_value
+      metrics:
+        - name: digital_share
+          offset_window: 1 year
+          alias: digital_share_py_value
+    config:
+      meta: {headline: false, unit: rate, area: Trends}
+
+  - name: digital_share_yoy_change
+    label: Digital share change (YoY, pp)
+    description: "Percentage points: 0.052 is +5.2 pp."
+    type: derived
+    type_params:
+      expr: digital_share - digital_share_py_value
+      metrics:
+        - name: digital_share
+        - name: digital_share
+          offset_window: 1 year
+          alias: digital_share_py_value
+    config:
+      meta: {headline: false, unit: rate, area: Trends}
+
+  - name: active_customers_py
+    label: Active customers PY
+    type: derived
+    type_params:
+      expr: active_customers_py_value
+      metrics:
+        - name: active_customers
+          offset_window: 1 year
+          alias: active_customers_py_value
+    config:
+      meta: {headline: false, unit: count, area: Trends}
+
+  - name: active_customers_yoy_growth
+    label: Active customers growth (YoY)
+    type: derived
+    type_params:
+      expr: (active_customers - active_customers_py_value) / nullif(active_customers_py_value, 0)
+      metrics:
+        - name: active_customers
+        - name: active_customers
+          offset_window: 1 year
+          alias: active_customers_py_value
+    config:
+      meta: {headline: false, unit: rate, area: Trends}
+
+  - name: channel_cost_yoy_growth
+    label: Channel cost growth (YoY)
+    type: derived
+    type_params:
+      expr: (channel_cost_egp - channel_cost_egp_py) / nullif(channel_cost_egp_py, 0)
+      metrics:
+        - name: channel_cost_egp
+        - name: channel_cost_egp
+          offset_window: 1 year
+          alias: channel_cost_egp_py
+    config:
+      meta: {headline: false, unit: rate, area: Trends}
+
+  - name: latest_transaction_date
+    label: Latest transaction date (YYYYMMDD)
+    type: simple
+    type_params:
+      measure:
+        name: latest_transaction_day
+    config:
+      meta: {headline: false, unit: date, area: Data Freshness}
+
+  - name: load_runs_in_data
+    label: Load runs in data
+    type: simple
+    type_params:
+      measure:
+        name: load_runs
+        fill_nulls_with: 0
+    config:
+      meta: {headline: false, unit: count, area: Data Freshness}
+
+  - name: latest_load_run
+    label: Latest load run (number)
+    description: Newest ingestion id in gold as a number (ING_20261013_001 is 20261013001).
+    type: simple
+    type_params:
+      measure:
+        name: latest_load_run_number
+    config:
+      meta: {headline: false, unit: id, area: Data Freshness}
+
+  # ---------------------------------------------------------------
+  # Data quality
+  # ---------------------------------------------------------------
+  # Over every validated run (dq_runs, dq_rule_checks), each with its
+  # current figures: counts after every correction round so far. Time is
+  # the run's ingestion day, so "per month" means the runs ingested that
+  # month. Besides month and total, "python dq.py semantic" stores them
+  # per run (grain run). Ad hoc, inside dbt/:
+  #
+  #   mf query --metrics final_dq_score,auto_fix_rate --group-by dq_run__run_id
+  #   mf query --metrics rule_failure_rate,rule_repair_rate --group-by rule_check__dq_dimension
+
+  - name: validated_runs
+    label: Validated runs
+    type: simple
+    type_params:
+      measure:
+        name: dq_run_count
+        fill_nulls_with: 0
+    config:
+      meta: {headline: false, unit: count, area: Data Quality}
+
+  - name: processed_records
+    label: Records processed
+    description: Records validated (input minus exact duplicate rows).
+    type: simple
+    type_params:
+      measure:
+        name: processed_records
+        fill_nulls_with: 0
+    config:
+      meta: {headline: true, unit: count, area: Data Quality}
+
+  - name: valid_records
+    label: Valid records
+    description: Accepted on the first validation (with or without automatic repairs).
+    type: simple
+    type_params:
+      measure:
+        name: valid_records
+        fill_nulls_with: 0
+    config:
+      meta: {headline: false, unit: count, area: Data Quality}
+
+  - name: clean_records
+    label: Clean records
+    description: Valid + resolved records.
+    type: simple
+    type_params:
+      measure:
+        name: clean_records
+        fill_nulls_with: 0
+    config:
+      meta: {headline: false, unit: count, area: Data Quality}
+
+  - name: initial_dq_score
+    label: Initial DQ score
+    description: Share of the records valid on the first validation.
+    type: ratio
+    type_params:
+      numerator: valid_records
+      denominator: processed_records
+    config:
+      meta: {headline: true, unit: rate, area: Data Quality}
+
+  - name: final_dq_score
+    label: Final DQ score
+    description: Share of the records clean after the corrections (valid + resolved).
+    type: ratio
+    type_params:
+      numerator: clean_records
+      denominator: processed_records
+    config:
+      meta: {headline: true, unit: rate, area: Data Quality}
+
+  - name: dq_score_uplift
+    label: DQ score uplift
+    description: Final - initial DQ score, what the corrections added.
+    type: derived
+    type_params:
+      expr: final_dq_score - initial_dq_score
+      metrics:
+        - name: final_dq_score
+        - name: initial_dq_score
+    config:
+      meta: {headline: true, unit: rate, area: Data Quality}
+
+  - name: records_with_issues
+    label: Records with issues
+    description: Records that needed an automatic repair or were quarantined.
+    type: simple
+    type_params:
+      measure:
+        name: records_with_issues
+        fill_nulls_with: 0
+    config:
+      meta: {headline: true, unit: count, area: Data Quality}
+
+  - name: auto_fixed_records
+    label: Auto-fixed records
+    description: Valid records that needed at least one automatic repair.
+    type: simple
+    type_params:
+      measure:
+        name: auto_fixed_records
+        fill_nulls_with: 0
+    config:
+      meta: {headline: false, unit: count, area: Data Quality}
+
+  - name: auto_fix_rate
+    label: Auto-fix rate
+    description: Share of the records with issues repaired automatically, with no person involved.
+    type: ratio
+    type_params:
+      numerator: auto_fixed_records
+      denominator: records_with_issues
+    config:
+      meta: {headline: true, unit: rate, area: Data Quality}
+
+  - name: quarantined_records
+    label: Quarantined records
+    type: simple
+    type_params:
+      measure:
+        name: quarantined_records
+        fill_nulls_with: 0
+    config:
+      meta: {headline: false, unit: count, area: Data Quality}
+
+  - name: quarantine_rate
+    label: Quarantine rate
+    description: Share of the records that failed the first validation.
+    type: ratio
+    type_params:
+      numerator: quarantined_records
+      denominator: processed_records
+    config:
+      meta: {headline: false, unit: rate, area: Data Quality}
+
+  - name: resolved_records
+    label: Resolved records
+    type: simple
+    type_params:
+      measure:
+        name: resolved_records
+        fill_nulls_with: 0
+    config:
+      meta: {headline: false, unit: count, area: Data Quality}
+
+  - name: resolution_rate
+    label: Resolution rate
+    description: Share of the quarantined records resolved by corrections.
+    type: ratio
+    type_params:
+      numerator: resolved_records
+      denominator: quarantined_records
+    config:
+      meta: {headline: true, unit: rate, area: Data Quality}
+
+  - name: manually_fixed_records
+    label: Manually fixed records
+    type: simple
+    type_params:
+      measure:
+        name: manually_fixed_records
+        fill_nulls_with: 0
+    config:
+      meta: {headline: false, unit: count, area: Data Quality}
+
+  - name: confirmed_records
+    label: Records confirmed after review
+    type: simple
+    type_params:
+      measure:
+        name: confirmed_records
+        fill_nulls_with: 0
+    config:
+      meta: {headline: false, unit: count, area: Data Quality}
+
+  - name: discarded_records
+    label: Discarded records
+    type: simple
+    type_params:
+      measure:
+        name: discarded_records
+        fill_nulls_with: 0
+    config:
+      meta: {headline: false, unit: count, area: Data Quality}
+
+  - name: unresolved_records
+    label: Unresolved records
+    description: Quarantined records still open or waiting for an expert.
+    type: simple
+    type_params:
+      measure:
+        name: unresolved_records
+        fill_nulls_with: 0
+    config:
+      meta: {headline: true, unit: count, area: Data Quality}
+
+  - name: values_checked
+    label: Values checked
+    type: simple
+    type_params:
+      measure:
+        name: values_checked
+        fill_nulls_with: 0
+    config:
+      meta: {headline: false, unit: count, area: Data Quality}
+
+  - name: values_failed
+    label: Values failed
+    type: simple
+    type_params:
+      measure:
+        name: values_failed
+        fill_nulls_with: 0
+    config:
+      meta: {headline: false, unit: count, area: Data Quality}
+
+  - name: values_repaired
+    label: Values repaired
+    type: simple
+    type_params:
+      measure:
+        name: values_repaired
+        fill_nulls_with: 0
+    config:
+      meta: {headline: false, unit: count, area: Data Quality}
+
+  - name: rule_failure_rate
+    label: Rule failure rate
+    description: Share of the checked values that failed a rule (first validation).
+    type: ratio
+    type_params:
+      numerator: values_failed
+      denominator: values_checked
+    config:
+      meta: {headline: true, unit: rate, area: Data Quality}
+
+  - name: rule_repair_rate
+    label: Rule repair rate
+    description: Share of the failed values repaired automatically.
+    type: ratio
+    type_params:
+      numerator: values_repaired
+      denominator: values_failed
+    config:
+      meta: {headline: true, unit: rate, area: Data Quality}

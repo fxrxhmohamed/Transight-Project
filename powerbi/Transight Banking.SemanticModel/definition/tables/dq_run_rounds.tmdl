@@ -1,0 +1,140 @@
+/// semantic.dq_run: one row per run and correction round (round history).
+table dq_run_rounds
+	lineageTag: 2b02da30-e130-5aa5-859d-1502279ff311
+
+	column run_id
+		dataType: string
+		lineageTag: ba4f003b-7cc0-5503-a04c-359502a58be2
+		summarizeBy: none
+		sourceColumn: run_id
+
+	column dataset
+		dataType: string
+		lineageTag: 99728be3-a185-514c-afe2-937f364d3831
+		summarizeBy: none
+		sourceColumn: dataset
+
+	column round
+		dataType: int64
+		formatString: 0
+		lineageTag: fae61cae-5e95-5a1d-8e17-4cd71f7e770e
+		summarizeBy: none
+		sourceColumn: round
+
+	column round_type
+		dataType: string
+		lineageTag: 6c6acdeb-adf3-5d64-a0dd-92db1550b7a8
+		summarizeBy: none
+		sourceColumn: round_type
+
+	column started_at
+		dataType: dateTime
+		formatString: yyyy-mm-dd hh:nn
+		lineageTag: ce65fbb7-e294-51a8-85cb-4c49ca4fa382
+		summarizeBy: none
+		sourceColumn: started_at
+
+		annotation UnderlyingDateTimeDataType = Date
+
+	column finished_at
+		dataType: dateTime
+		formatString: yyyy-mm-dd hh:nn
+		lineageTag: 06d3a3ef-f5ef-54a9-beec-b994f5f9fb7b
+		summarizeBy: none
+		sourceColumn: finished_at
+
+		annotation UnderlyingDateTimeDataType = Date
+
+	column processed
+		dataType: int64
+		formatString: #,0
+		lineageTag: 367473bf-bc1a-50f9-8002-51032a82f748
+		summarizeBy: none
+		sourceColumn: processed
+
+	column records_with_issues
+		dataType: int64
+		formatString: #,0
+		lineageTag: c99281e5-4574-5dd6-b67f-a94a2406efcd
+		summarizeBy: none
+		sourceColumn: records_with_issues
+
+	column auto_fixed_records
+		dataType: int64
+		formatString: #,0
+		lineageTag: c9cb74b7-2aa4-530a-98da-a717f7c517aa
+		summarizeBy: none
+		sourceColumn: auto_fixed_records
+
+	column quarantined
+		dataType: int64
+		formatString: #,0
+		lineageTag: b5754fbe-5d7e-5448-a894-d5142824f54c
+		summarizeBy: none
+		sourceColumn: quarantined
+
+	column round_revalidated
+		dataType: int64
+		formatString: #,0
+		lineageTag: 3a7d4455-79fb-5f18-94a0-44246484deff
+		summarizeBy: none
+		sourceColumn: round_revalidated
+
+	column round_resolved
+		dataType: int64
+		formatString: #,0
+		lineageTag: 3d4b86e5-8e51-5f49-8e1f-64bdc4b783a8
+		summarizeBy: none
+		sourceColumn: round_resolved
+
+	column round_failed_again
+		dataType: int64
+		formatString: #,0
+		lineageTag: 1258b0de-4932-5817-b0ac-02f437cb1176
+		summarizeBy: none
+		sourceColumn: round_failed_again
+
+	column resolved
+		dataType: int64
+		formatString: #,0
+		lineageTag: 673f527e-df83-5844-8ad3-22ee49b4839f
+		summarizeBy: none
+		sourceColumn: resolved
+
+	column unresolved_records
+		dataType: int64
+		formatString: #,0
+		lineageTag: cbce8d1d-7910-5f75-b0df-2e700ce1bd3a
+		summarizeBy: none
+		sourceColumn: unresolved_records
+
+	column initial_dq_score
+		dataType: double
+		formatString: 0.0000%
+		lineageTag: 9a426930-f55b-5d0f-bad2-6458fe4d8130
+		summarizeBy: none
+		sourceColumn: initial_dq_score
+
+	column final_dq_score
+		dataType: double
+		formatString: 0.0000%
+		lineageTag: 1a0cfd7f-dc11-5c44-9f8a-321dc5e53e14
+		summarizeBy: none
+		sourceColumn: final_dq_score
+
+	column is_latest_round
+		dataType: boolean
+		lineageTag: 855ed95e-2de0-50d4-91ff-2b0caad38295
+		summarizeBy: none
+		sourceColumn: is_latest_round
+
+	partition dq_run_rounds = m
+		mode: import
+		source =
+				let
+				    Source = PostgreSQL.Database(PgServer, PgDatabase),
+				    Data = Source{[Schema = "semantic", Item = "dq_run"]}[Data],
+				    Selected = Table.SelectColumns(Data, {"run_id", "dataset", "round", "round_type", "started_at", "finished_at", "processed", "records_with_issues", "auto_fixed_records", "quarantined", "round_revalidated", "round_resolved", "round_failed_again", "resolved", "unresolved_records", "initial_dq_score", "final_dq_score", "is_latest_round"})
+				in
+				    Selected
+

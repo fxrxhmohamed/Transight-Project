@@ -17,6 +17,7 @@ MARKERS = {
     "01_bronze.sql": ("bronze.ingestion",),
     "02_dq.sql": ("dq.run", "dq.load_log"),
     "03_meta_gold.sql": ("meta.dataset",),
+    "05_semantic.sql": ("semantic.metric_definition", "semantic.metric_value"),
 }
 
 _ready: set[str] = set()

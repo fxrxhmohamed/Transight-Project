@@ -1,0 +1,51 @@
+/// semantic.dq_quarantine: records per latest status.
+table dq_quarantine_status
+	lineageTag: e04e3c1e-57fa-592c-addd-8b330d4a436f
+
+	/// quarantined records by their latest status (semantic.dq_quarantine is a status log)
+	measure 'Quarantined Records (Latest Status)' = SUM ( 'dq_quarantine_status'[records] )
+		formatString: #,0
+		displayFolder: DQ Corrections
+		lineageTag: cdb824b2-e81e-507b-ac82-f4fb88d1742a
+
+	column run_id
+		dataType: string
+		lineageTag: 7aa8ee36-80ff-528a-bfb4-88ab67442bfe
+		summarizeBy: none
+		sourceColumn: run_id
+
+	column dataset
+		dataType: string
+		lineageTag: 96a070ec-28c9-5ca4-8e92-68ad2c03f5f3
+		summarizeBy: none
+		sourceColumn: dataset
+
+	column status
+		dataType: string
+		lineageTag: 0329f716-59fc-5a6a-a556-0ebc28fb4524
+		summarizeBy: none
+		sourceColumn: status
+
+	column records
+		dataType: int64
+		isHidden
+		formatString: #,0
+		lineageTag: 1bc15690-e539-5ae2-9f49-55577490fd7a
+		summarizeBy: none
+		sourceColumn: records
+
+	partition dq_quarantine_status = m
+		mode: import
+		source =
+				let
+				    Source = PostgreSQL.Database(PgServer, PgDatabase),
+				    Log = Source{[Schema = "semantic", Item = "dq_quarantine"]}[Data],
+				    // dq_quarantine logs every status change: keep each record's latest one
+				    Selected = Table.SelectColumns(Log, {"run_id", "dataset", "record_id", "sequence", "status"}),
+				    Latest = Table.Group(Selected, {"run_id", "dataset", "record_id"},
+				        {{"status", each Table.Max(_, "sequence")[status], type text}}),
+				    Counted = Table.Group(Latest, {"run_id", "dataset", "status"},
+				        {{"records", each Table.RowCount(_), Int64.Type}})
+				in
+				    Counted
+

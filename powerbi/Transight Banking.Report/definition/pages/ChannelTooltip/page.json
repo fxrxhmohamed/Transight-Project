@@ -1,0 +1,15 @@
+{
+  "$schema": "https://developer.microsoft.com/json-schemas/fabric/item/report/definition/page/2.1.0/schema.json",
+  "name": "ChannelTooltip",
+  "displayName": "Channel Tooltip",
+  "displayOption": "FitToPage",
+  "height": 240,
+  "width": 320,
+  "pageBinding": {
+    "name": "df1338d9d933553dbc70",
+    "type": "Tooltip",
+    "parameters": []
+  },
+  "visibility": "HiddenInViewMode",
+  "type": "Tooltip"
+}
