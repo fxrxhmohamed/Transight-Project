@@ -18,6 +18,7 @@ MARKERS = {
     "02_dq.sql": ("dq.run", "dq.load_log"),
     "03_meta_gold.sql": ("meta.dataset",),
     "05_semantic.sql": ("semantic.metric_definition", "semantic.metric_value"),
+    "06_drift.sql": ("dq.drift_check", "dq.drift_finding"),
 }
 
 _ready: set[str] = set()

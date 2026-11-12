@@ -34,16 +34,12 @@ table dq_run_rounds
 		summarizeBy: none
 		sourceColumn: started_at
 
-		annotation UnderlyingDateTimeDataType = Date
-
 	column finished_at
 		dataType: dateTime
 		formatString: yyyy-mm-dd hh:nn
 		lineageTag: 06d3a3ef-f5ef-54a9-beec-b994f5f9fb7b
 		summarizeBy: none
 		sourceColumn: finished_at
-
-		annotation UnderlyingDateTimeDataType = Date
 
 	column processed
 		dataType: int64

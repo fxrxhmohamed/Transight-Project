@@ -90,6 +90,7 @@ MERGE = DQ / "merge.py"
 METRICS = DQ / "metrics.py"
 IMPORT_FILES = DQ / "import_files.py"
 UI = DQ / "correction_ui.py"
+DRIFT = SERVICES / "metadata-service" / "src" / "drift.py"
 
 DEFAULT_RULES = ROOT / "config" / "rules" / "quality_rules.yaml"
 DEFAULT_DATA = ROOT / "data"
@@ -142,6 +143,13 @@ def command_line(step: str, args: argparse.Namespace) -> list[str]:
     if step == "profile":
         return [str(PROFILER), "--ingestion", args.run,
                 "--dataset-name", dataset_name(args.rules)]
+
+    if step == "drift":
+        line = [str(DRIFT), "--ingestion", args.run,
+                "--dataset-name", dataset_name(args.rules)]
+        if getattr(args, "against", None):
+            line += ["--against", args.against]
+        return line + (["--no-email"] if getattr(args, "no_email", False) else [])
 
     if step == "validate":
         line = [str(ENGINE), "--ingestion", args.run, "--rules", str(args.rules)]
@@ -225,7 +233,7 @@ def run_pipeline(args: argparse.Namespace) -> int:
         return process.returncode
 
     args.run = line.strip()
-    for step in ("profile", "validate", "merge", "metrics", "metadata", "gold", "semantic"):
+    for step in ("profile", "drift", "validate", "merge", "metrics", "metadata", "gold", "semantic"):
         code = run_step(step, args)
         if code:
             return code
@@ -267,6 +275,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                           help="Load the file even when it is already in bronze.")
 
     add("profile", "Profile an ingestion.")
+
+    drift = add("drift", "Compare an ingestion's profile with the previous file's.")
+    drift.add_argument("--against", default=None,
+                       help="Ingestion id to compare with (default: the previous one).")
+    drift.add_argument("--no-email", action="store_true")
 
     validate = add("validate", "Validate an ingestion.")
     validate.add_argument("--force", action="store_true",

@@ -111,6 +111,7 @@ with DAG(
                   skip_on_exit_code=99, env={"DQ_INPUT": "{{ params.input }}"},
                   append_env=True)
     profile = task("profile", "profile", f"--run {INGESTED}")
+    drift = task("drift", "drift", f"--run {INGESTED}")
     validate = task("validate", "validate", f"--run {INGESTED}")
     merge = task("merge", "merge", f"--run {INGESTED}")
     metrics = task("metrics", "metrics")
@@ -119,7 +120,7 @@ with DAG(
     semantic = task("semantic", "semantic")
     powerbi = task("powerbi", "powerbi-refresh")
 
-    ingest >> profile >> validate >> merge >> metrics >> metadata >> gold >> semantic >> powerbi
+    ingest >> profile >> drift >> validate >> merge >> metrics >> metadata >> gold >> semantic >> powerbi
 
 
 with DAG(

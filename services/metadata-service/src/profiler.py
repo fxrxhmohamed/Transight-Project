@@ -143,6 +143,8 @@ MISSINGNESS_CATEGORY_PURITY = 0.98
 MISSINGNESS_MIN_COVERAGE = 0.90
 MISSINGNESS_MAX_CATEGORIES = 30
 
+# Full list of categories kept in a profile (for the drift check).
+CATEGORY_VALUES_MAX = 200
 
 # ============================================================
 # Patterns and name hints
@@ -1237,6 +1239,12 @@ def profile_column(
             {"value": safe_value(value), "count": int(count)}
             for value, count in counts.head(TOP_N).items()
         ]
+        
+        if logical_type == "categorical":
+            # Normalized, so 'MOBILE APP' / 'Mobile_App' are one value.
+            found = sorted({str(v) for v in normalized})
+            if len(found) <= CATEGORY_VALUES_MAX:
+                profile["category_values"] = found
 
         if len(variant_keys) and logical_type in (
             "categorical", "text", "currency_code",

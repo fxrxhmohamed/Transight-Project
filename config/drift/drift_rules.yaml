@@ -1,0 +1,13 @@
+row_count:
+  drop_pct: 0.5        # critical when rows fall by 50 % or more
+  rise_pct: 1.0        # warning when rows grow by 100 % or more
+null_rate:
+  warning_pp: 5        # percentage points more missing than the previous file
+  critical_pp: 20
+new_categories:        # only these columns are watched (no personal data)
+  critical: [channel, transaction_type, transaction_status, currency]
+  warning:  [card_type, failure_reason, account_type, account_status, customer_segment, bank_name]
+mean_change:
+  columns: [transaction_amount]
+  warning_pct: 0.5
+  critical_pct: 1.0
