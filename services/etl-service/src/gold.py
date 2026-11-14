@@ -25,10 +25,12 @@ Usage
 
 from __future__ import annotations
 
+from pyspark.sql import functions as F  # noqa: E402
 import argparse
 import sys
 from pathlib import Path
 from typing import Any
+from scd2 import build_entity_history  # noqa: E402
 
 ROOT = Path(__file__).resolve().parents[3]
 sys.path.append(str(ROOT / "services" / "common" / "src"))
@@ -90,33 +92,79 @@ def plan(meta: dict[str, Any]) -> dict[str, dict[str, Any]]:
     """Table name -> key and columns of every gold table."""
 
     if not meta["grain"]:
-        raise ConfigError("The dataset has no grain entity (an entity keyed by the "
-                          "primary key); gold needs one for its fact table.")
+        raise ConfigError(
+            "The dataset has no grain entity (an entity keyed by the "
+            "primary key); gold needs one for its fact table."
+        )
+
     keys = {e: key for e, key, _, _ in meta["entities"]}
     referenced = {}
+
     for entity, column in meta["references"]:
         referenced.setdefault(entity, []).append(column)
 
     tables = {}
     grain_key = keys[meta["grain"]]
+
     fact_columns = [grain_key] + [
         c for c, entity, is_key in meta["columns"]
         if entity == meta["grain"] and c != grain_key
     ]
-    fact_columns += [key for e, key in keys.items()
-                     if e != meta["grain"] and key not in fact_columns]
+
+    fact_columns += [
+        key for e, key in keys.items()
+        if e != meta["grain"] and key not in fact_columns
+    ]
+
+    # Customer surrogate key: links each transaction to a specific
+    # historical version of its customer.
+    customer_entity = "customer" if "customer" in keys else None
+
+    if customer_entity and customer_entity != meta["grain"]:
+        if "customer_sk" not in fact_columns:
+            fact_columns.append("customer_sk")
+
     tables[f"fact_{bronze.table_name_of(meta['grain'])}"] = {
-        "key": [grain_key], "columns": [*fact_columns, "run_id", "record_id"],
+        "key": [grain_key],
+        "columns": [*fact_columns, "run_id", "record_id"],
     }
 
     for entity, key, attributes, is_grain in meta["entities"]:
         if is_grain:
             continue
-        columns = [key] + [a for a in attributes if a != key]
-        columns += [c for c in referenced.get(entity, []) if c not in columns]
-        tables[f"dim_{bronze.table_name_of(entity)}"] = {"key": [key], "columns": columns}
-    return tables
 
+        if entity == customer_entity:
+            columns = [
+                "customer_sk",
+                key,
+                *[a for a in attributes if a != key],
+                *[
+                    c for c in referenced.get(entity, [])
+                    if c not in attributes and c != key
+                ],
+                "valid_from",
+                "valid_to",
+                "is_current",
+            ]
+
+            tables[f"dim_{bronze.table_name_of(entity)}"] = {
+                "key": ["customer_sk"],
+                "columns": list(dict.fromkeys(columns)),
+            }
+            continue
+
+        columns = [key] + [a for a in attributes if a != key]
+        columns += [
+            c for c in referenced.get(entity, [])
+            if c not in columns
+        ]
+
+        tables[f"dim_{bronze.table_name_of(entity)}"] = {
+            "key": [key],
+            "columns": columns,
+        }
+
+    return tables
 
 def written(df: DataFrame, columns: list[str], types: dict[str, str]) -> DataFrame:
     """Dates as ISO text (PostgreSQL converts them; no time zone shifts)."""
@@ -151,60 +199,253 @@ def dim_date(fact: DataFrame, date_columns: list[str]) -> DataFrame | None:
     )
 
 
+
 def build(dataset: str) -> dict[str, int]:
     meta = load_meta(dataset)
     table = meta["silver_table"].split(".", 1)[1]
+
     with bronze.connect() as conn:
         types = silver_columns(conn, table)
-    records = current_records(table, types, meta["primary_key"]).persist(
-        StorageLevel.MEMORY_AND_DISK)
+
+    records = current_records(
+        table, types, meta["primary_key"]
+    ).persist(StorageLevel.MEMORY_AND_DISK)
 
     tables = plan(meta)
+
+    # Identify customer metadata for SCD Type 2.
+    customer_meta = next(
+        (
+            (entity, key, attributes)
+            for entity, key, attributes, is_grain in meta["entities"]
+            if entity == "customer" and not is_grain
+        ),
+        None,
+    )
+
+    customer_history = None
+    customer_key = None
+    customer_dim_name = None
+
+    history_types = dict(types)
+
+    if customer_meta:
+        customer_entity, customer_key, customer_attributes = customer_meta
+
+        customer_references = [
+            column
+            for entity, column in meta["references"]
+            if entity == customer_entity
+        ]
+
+        # Build every observed customer version from accepted DQ records.
+        customer_history = build_entity_history(
+            dataset=dataset,
+            entity=customer_entity,
+            key=customer_key,
+            attributes=customer_attributes,
+            references=customer_references,
+            types=types,
+        )
+
+        customer_dim_name = (
+            f"dim_{bronze.table_name_of(customer_entity)}"
+        )
+
+        # Types generated by the SCD2 process.
+        history_types.update({
+            "customer_sk": "bigint",
+            "valid_from": "timestamp",
+            "valid_to": "timestamp",
+            "is_current": "boolean",
+        })
+
     frames: dict[str, DataFrame] = {}
     ddl: dict[str, tuple[list[str], dict[str, str]]] = {}
-    for name, spec in tables.items():
-        key, columns = spec["key"], spec["columns"]
-        if name.startswith("fact_"):
-            df = records.filter(" AND ".join(f"{ident(k)} IS NOT NULL" for k in key))
-        else:
-            # The key's most recent record.
-            df = records.filter(f"{ident(key[0])} IS NOT NULL").selectExpr(
-                "*", f"row_number() OVER (PARTITION BY {ident(key[0])} "
-                     "ORDER BY run_id DESC, record_id DESC) AS __latest",
-            ).filter("__latest = 1")
-        frames[name] = written(df, columns, types)
-        ddl[name] = (key, {c: types[c] for c in columns})
 
-    fact_name = next(n for n in tables if n.startswith("fact_"))
-    dates = [c for c in tables[fact_name]["columns"] if types.get(c) == "date"]
+    fact_name = next(
+        name for name in tables if name.startswith("fact_")
+    )
+
+    for name, spec in tables.items():
+        key = spec["key"]
+        columns = spec["columns"]
+
+        frame_types = dict(types)
+
+        if name == customer_dim_name:
+            # Customer dimension contains all historical versions.
+            df = customer_history
+            frame_types = history_types
+
+        elif name == fact_name:
+            # Keep the existing transaction-grain fact construction.
+            df = records.filter(
+                " AND ".join(
+                    f"{ident(k)} IS NOT NULL" for k in key
+                )
+            )
+
+            if customer_history is not None:
+                # Get the observation timestamp of each transaction.
+                ingestion_times = spark_io.read(
+                    """
+                    SELECT
+                        ingestion_id AS run_id,
+                        ingested_at
+                    FROM bronze.ingestion
+                    """
+                )
+
+                fact_with_time = (
+                    df.alias("f")
+                    .join(
+                        ingestion_times.alias("i"),
+                        F.col("f.run_id").cast("string")
+                        == F.col("i.run_id").cast("string"),
+                        "left",
+                    )
+                    .select(
+                        "f.*",
+                        F.col("i.ingested_at").alias(
+                            "__observed_at"
+                        ),
+                    )
+                )
+
+                # Match the transaction to the customer version
+                # that was valid when this transaction was observed.
+                f = fact_with_time.alias("f")
+                c = customer_history.alias("c")
+
+                match_condition = (
+                    (
+                        F.col(f"f.{customer_key}")
+                        == F.col(f"c.{customer_key}")
+                    )
+                    & (
+                        F.col("f.__observed_at")
+                        >= F.col("c.valid_from")
+                    )
+                    & (
+                        F.col("c.valid_to").isNull()
+                        | (
+                            F.col("f.__observed_at")
+                            < F.col("c.valid_to")
+                        )
+                    )
+                )
+
+                df = (
+                    f.join(c, match_condition, "left")
+                    .select(
+                        "f.*",
+                        F.col("c.customer_sk").alias(
+                            "customer_sk"
+                        ),
+                    )
+                )
+
+                # Fail rather than silently assigning a wrong version.
+                unmatched = (
+                    df.filter(
+                        F.col(customer_key).isNotNull()
+                        & F.col("customer_sk").isNull()
+                    )
+                    .limit(1)
+                    .collect()
+                )
+
+                if unmatched:
+                    raise RuntimeError(
+                        "Could not match a transaction to a customer "
+                        f"history version. Example: {unmatched[0].asDict()}"
+                    )
+
+                frame_types["customer_sk"] = "bigint"
+
+        else:
+            # Preserve the original latest-record behavior
+            # for all other dimensions.
+            df = records.filter(
+                f"{ident(key[0])} IS NOT NULL"
+            ).selectExpr(
+                "*",
+                f"row_number() OVER (PARTITION BY {ident(key[0])} "
+                "ORDER BY run_id DESC, record_id DESC) AS __latest",
+            ).filter("__latest = 1")
+
+        frames[name] = written(
+            df, columns, frame_types
+        )
+
+        ddl[name] = (
+            key,
+            {
+                column: frame_types[column]
+                for column in columns
+            },
+        )
+
+    # Build the date dimension from the fact's date columns.
+    dates = [
+        column
+        for column in tables[fact_name]["columns"]
+        if types.get(column) == "date"
+    ]
+
     calendar = dim_date(records, dates)
+
     if calendar is not None:
         frames["dim_date"] = calendar
-        ddl["dim_date"] = (["date_key"], DATE_COLUMNS)
+        ddl["dim_date"] = (
+            ["date_key"],
+            DATE_COLUMNS,
+        )
 
     # ---- Load under temporary names, then swap in one transaction ----
     with bronze.connect() as conn:
         for name, (key, columns) in ddl.items():
             staged = quote(f"{name}__new")
-            conn.execute(f"DROP TABLE IF EXISTS gold.{staged}")
+
+            conn.execute(
+                f"DROP TABLE IF EXISTS gold.{staged}"
+            )
+
             conn.execute(
                 f"CREATE TABLE gold.{staged} ("
-                + ", ".join(f"{quote(c)} {kind}" for c, kind in columns.items())
+                + ", ".join(
+                    f"{quote(column)} {kind}"
+                    for column, kind in columns.items()
+                )
                 + f", PRIMARY KEY ({', '.join(quote(k) for k in key)}))"
             )
+
         conn.commit()
 
     counts = {}
+
     for name, df in frames.items():
-        spark_io.write(df, f"gold.{quote(name + '__new')}")
+        spark_io.write(
+            df,
+            f"gold.{quote(name + '__new')}",
+        )
         counts[name] = df.count()
+
     records.unpersist()
 
     # CASCADE: anything still depending on the old tables goes with them.
     with bronze.connect() as conn, conn.transaction():
         for name in ddl:
-            conn.execute(f"DROP TABLE IF EXISTS gold.{quote(name)} CASCADE")
-            conn.execute(f"ALTER TABLE gold.{quote(name + '__new')} RENAME TO {quote(name)}")
+            conn.execute(
+                f"DROP TABLE IF EXISTS gold.{quote(name)} CASCADE"
+            )
+
+            conn.execute(
+                f"ALTER TABLE gold.{quote(name + '__new')} "
+                f"RENAME TO {quote(name)}"
+            )
+
     return counts
 
 

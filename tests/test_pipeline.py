@@ -575,3 +575,144 @@ def test_airflow_emails_success_and_failure(monkeypatch) -> None:
     assert failure["Subject"] == "[Transight] FAILED: dq_publish (task merge)"
     assert "exit code 2" in failure.get_content()
     assert "/dags/dq_publish/runs/" in failure.get_content()
+
+@pytest.fixture(scope="module")
+def customer_scd2_scenario(
+    database: str,
+    run: Run,
+    tmp_path_factory: pytest.TempPathFactory,
+) -> dict[str, str]:
+    """Create two observations for the same customer with different segments."""
+
+    folder = tmp_path_factory.mktemp("customer_scd2")
+
+    sample = pd.read_csv(
+        SAMPLE,
+        dtype=str,
+        keep_default_na=False,
+        encoding="utf-8-sig",
+    )
+
+    customer_rows = sample.loc[
+        sample["customer_id"].eq("CUST030371")
+    ]
+    assert not customer_rows.empty
+
+    original = customer_rows.iloc[0].copy()
+
+    scenarios = [
+        ("TXN9999999001", "SME", "first.csv"),
+        ("TXN9999999002", "Premium", "second.csv"),
+    ]
+
+    transaction_ids = {}
+
+    for label, segment, filename in scenarios:
+        row = original.copy()
+        row["transaction_id"] = label
+        row["customer_segment"] = segment
+
+        input_file = folder / filename
+        pd.DataFrame([row]).to_csv(input_file, index=False)
+
+        ingested = dq("ingest", "--input", input_file)
+        run_id = ingested.stdout.strip().splitlines()[-1]
+
+        options = ["--run", run_id]
+
+        dq("profile", *options)
+        dq("validate", *options)
+        dq("merge", *options)
+
+        transaction_ids[label] = label
+
+    dq("metadata")
+    dq("gold")
+
+    return transaction_ids
+
+def test_customer_scd2_history(
+    customer_scd2_scenario: dict[str, str],
+    database: str,
+) -> None:
+    with connect(database) as conn:
+        rows = conn.execute(
+            """
+            SELECT
+                customer_sk,
+                customer_segment,
+                valid_from,
+                valid_to,
+                is_current
+            FROM gold.dim_customer
+            WHERE customer_id = 'CUST030371'
+            ORDER BY valid_from
+            """
+        ).fetchall()
+
+    premium_versions = [
+        row for row in rows
+        if row[1] == "Premium" and row[4] is True
+    ]
+
+    assert len(premium_versions) == 1
+
+    premium = premium_versions[0]
+
+    previous_versions = [
+        row for row in rows
+        if row[1] == "SME"
+        and row[3] == premium[2]
+        and row[4] is False
+    ]
+
+    assert len(previous_versions) >= 1
+
+    previous = previous_versions[-1]
+
+    assert previous[0] != premium[0]
+    assert previous[3] == premium[2]
+    assert previous[4] is False
+    assert premium[3] is None
+    assert premium[4] is True
+def test_fact_to_customer_version_mapping(
+    customer_scd2_scenario: dict[str, str],
+    database: str,
+) -> None:
+    with connect(database) as conn:
+        rows = conn.execute(
+            """
+            SELECT
+                f.transaction_id,
+                f.customer_sk,
+                d.customer_id,
+                d.customer_segment,
+                d.is_current
+            FROM gold.fact_transaction f
+            JOIN gold.dim_customer d
+                ON f.customer_sk = d.customer_sk
+            WHERE f.transaction_id IN (%s, %s)
+            ORDER BY f.transaction_id
+            """,
+            (
+                customer_scd2_scenario["TXN9999999001"],
+                customer_scd2_scenario["TXN9999999002"],
+            ),
+        ).fetchall()
+
+    assert len(rows) == 2
+
+    mapped = {row[0]: row for row in rows}
+
+    old_transaction = mapped["TXN9999999001"]
+    new_transaction = mapped["TXN9999999002"]
+
+    assert old_transaction[2] == "CUST030371"
+    assert old_transaction[3] == "SME"
+    assert old_transaction[4] is False
+
+    assert new_transaction[2] == "CUST030371"
+    assert new_transaction[3] == "Premium"
+    assert new_transaction[4] is True
+
+    assert old_transaction[1] != new_transaction[1]
