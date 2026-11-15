@@ -21,9 +21,7 @@ x-database: &database
   POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-change_me_local_only}
 
 services:
-  # Bronze, dq, silver, gold, meta and metrics schemas. sql/*.sql runs once,
-  # on the first start of an empty volume (the steps create their tables
-  # themselves on older volumes).
+  # Bronze, dq, silver, gold, meta and metrics schemas.
   postgres:
     image: postgres:17
     environment:
@@ -41,9 +39,6 @@ services:
       retries: 10
     restart: unless-stopped
 
-  # Spark standalone cluster that Airflow submits the steps to. Executors
-  # read the source files from the mounted project and talk to postgres
-  # over JDBC; they never run Python (the steps use Spark SQL only).
   spark-master:
     image: apache/spark:4.1.1
     command: /opt/spark/bin/spark-class org.apache.spark.deploy.master.Master
@@ -63,8 +58,6 @@ services:
       - spark-master
     restart: unless-stopped
 
-  # Runtime of dq.py and the tests (Spark in local mode inside the
-  # container). Only started by "docker compose run".
   pipeline:
     build:
       context: .
@@ -86,8 +79,6 @@ services:
       postgres:
         condition: service_healthy
 
-  # Correction UI (Streamlit). Sending changes re-validates them with Spark
-  # in this container.
   ui:
     image: metaflow-pipeline
     command: >
@@ -98,13 +89,8 @@ services:
       - "${UI_PORT:-8501}:8501"
     environment:
       <<: *database
-      # Revalidation reads the whole valid dataset as context for the
-      # cross-row rules. local[*] would run one task per host core (20+),
-      # all sharing this heap: a few cores give each task room.
       SPARK_MASTER: local[${UI_SPARK_CORES:-4}]
       SPARK_DRIVER_MEMORY: ${UI_DRIVER_MEMORY:-4g}
-      # An uploaded correction file triggers the dq_apply_corrections DAG
-      # (airflow_trigger.py); the file is saved under data/corrections/.
       AIRFLOW_API_URL: http://airflow:8080
       AIRFLOW_UI_URL: http://localhost:8080
     volumes:
@@ -118,8 +104,6 @@ services:
     build:
       context: .
       dockerfile: airflow/Dockerfile
-      # The pipeline image's Python packages are copied, not downloaded
-      # again: build the pipeline image first (docker compose build pipeline).
       additional_contexts:
         pipeline: docker-image://metaflow-pipeline
     image: metaflow-airflow
@@ -131,22 +115,21 @@ services:
       <<: *database
       AIRFLOW__CORE__DAGS_FOLDER: /opt/metaflow/airflow/dags
       AIRFLOW__CORE__LOAD_EXAMPLES: "false"
-      # Local development: everyone is admin, no login screen.
       AIRFLOW__CORE__SIMPLE_AUTH_MANAGER_ALL_ADMINS: "true"
       METAFLOW_HOME: /opt/metaflow
       METAFLOW_PYTHON: /home/airflow/metaflow-venv/bin/python
-      # The steps' Spark jobs run on the cluster; executors reach the
-      # driver (the task) at this address.
+      DBT: /opt/dbt/bin/dbt
       SPARK_MASTER: spark://spark-master:7077
       SPARK_DRIVER_HOST: airflow
       SPARK_DRIVER_MEMORY: 2g
-      # E-mail on every DAG run (airflow/dags/dq_notify.py), from .env.
       DQ_ALERT_EMAIL: ${DQ_ALERT_EMAIL:-}
       SMTP_HOST: ${SMTP_HOST:-smtp.gmail.com}
       SMTP_PORT: ${SMTP_PORT:-587}
       SMTP_USER: ${SMTP_USER:-}
       SMTP_PASSWORD: ${SMTP_PASSWORD:-}
       SMTP_FROM: ${SMTP_FROM:-}
+      # Used by airflow_trigger.py inside Airflow tasks.
+      AIRFLOW_API_URL: http://airflow:8080
       AIRFLOW_UI_URL: http://localhost:8080
     depends_on:
       postgres:
@@ -159,7 +142,5 @@ services:
     restart: unless-stopped
 
 volumes:
-  # All pipeline data: bronze, dq, silver, gold, meta and metrics.
   postgres-data:
-  # Airflow's own database and logs.
   airflow-home:
