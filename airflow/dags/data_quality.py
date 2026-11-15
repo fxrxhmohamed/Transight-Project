@@ -48,7 +48,13 @@ Environment of the Airflow workers
 from __future__ import annotations
 
 import os
+import sys
 from datetime import datetime, timedelta
+
+# Ensure the DAGs directory is available for local module imports.
+DAGS_DIR = os.path.dirname(os.path.abspath(__file__))
+if DAGS_DIR not in sys.path:
+    sys.path.insert(0, DAGS_DIR)
 
 import dq_notify
 
@@ -79,8 +85,18 @@ def dq(step: str, arguments: str = "") -> str:
     return f'cd "{HOME}" && {PYTHON} dq.py {step} {arguments}'.strip()
 
 
+
 def task(task_id: str, step: str, arguments: str = "", **kwargs) -> BashOperator:
-    return BashOperator(task_id=task_id, bash_command=dq(step, arguments), **kwargs)
+    env = {"DBT": os.environ.get("DBT") or "/opt/dbt/bin/dbt"}
+    env.update(kwargs.pop("env", {}))
+    kwargs.setdefault("append_env", True)
+    return BashOperator(
+        task_id=task_id,
+        bash_command=dq(step, arguments),
+        env=env,
+        **kwargs
+    )
+
 
 
 # The ingestion id printed by the ingest task (its last output line).
